@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#111111">
+  <title>Mini Motorways — PWA Prototype</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    /* Prototype styles — keep minimal and performance-friendly */
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #111111;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      touch-action: manipulation;
+    }
+
+    canvas {
+      display: block;
+      image-rendering: crisp-edges;
+      border: 3px solid #222222;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
+      background: #e8e4d8; /* matches COLORS.background */
+      touch-action: none; /* prevent browser gestures during road drawing */
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .instructions {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #666666;
+      font-size: 11px;
+      line-height: 1.3;
+      text-align: center;
+      pointer-events: none;
+      max-width: 420px;
+      padding: 0 12px;
+      opacity: 0.65;
+      z-index: 10;
+    }
+
+    .instructions kbd {
+      font-family: ui-monospace, monospace;
+      background: #222;
+      color: #aaa;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 10px;
+    }
+  </style>
+</head>
+<body>
+  <!-- 
+    Canvas sized in JS (48×48 tiles × 32 px = 1536×1536 internal resolution).
+    main.js overrides width/height attributes after measuring.
+  -->
+  <canvas id="game" width="1536" height="1536" aria-label="Mini Motorways game canvas"></canvas>
+
+  <div class="instructions">
+    Drag between adjacent tiles to draw/remove roads • 
+    Vehicles deliver from houses (circles) to destinations (squares) • 
+    Avoid congestion or buildings will overload • 
+    <kbd>R</kbd> or tap after GAME OVER to restart
+  </div>
+
+  <!-- 
+    Loads the ES module entry point.
+    main.js wires everything (input, loop, state, render) on DOMContentLoaded.
+  -->
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

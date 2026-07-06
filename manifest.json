@@ -1,0 +1,24 @@
+{
+  "name": "Mini Motorways — PWA Prototype",
+  "short_name": "Mini Motorways",
+  "description": "Browser-based PWA prototype of a Mini Motorways–style traffic puzzle game. Canvas2D only; prototype for Defold port.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#111111",
+  "theme_color": "#111111",
+  "icons": [
+    {
+      "src": "assets/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "assets/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
