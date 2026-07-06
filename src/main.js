@@ -312,9 +312,9 @@ function updateSimulation(dt) {
         const tile = findRandomEmptyInPlayable(state.buildings);
         if (tile) {
           if (Math.random() < 0.65) {
-            createBuilding(state.buildings, 'house', tile, chosenColor);
+            spawnHouse(state.buildings, state.roads);
           } else {
-            createBuilding(state.buildings, 'destination', tile, chosenColor);
+            spawnDestination(state.buildings, state.roads);
           }
         }
       }
