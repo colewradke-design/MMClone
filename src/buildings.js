@@ -1,9 +1,21 @@
 /**
  * src/buildings.js
- * Purpose: Building creation/removal, spawn helpers (random empty tile placement), supply/demand (waitingCount) management, wait timer increments and overload state transitions. Color assignment added to creation (random balanced from 5 colors or explicit valid value). Owns all Building data mutations and queries for the house/destination model. Overload flag is sticky (see resetOverload).
- * Expected scale: ~145 LOC. Added color handling in createBuilding + new getDestinationsByColor query (~10 LOC growth). Moderate complexity from tile occupancy checks, timer side-effects, sticky overload, and spawn sampling.
+ * Purpose: Building creation/removal, spawn helpers (random empty tile placement now supporting optional road-connection avoidance for Phase 1), supply/demand (waitingCount) management, wait timer increments and overload state transitions. Color assignment in creation. Owns all Building data mutations and queries. Overload flag is sticky.
+ * Expected scale: ~158 LOC (~13 LOC growth from private helper, param plumbing on 3 functions, and JSDoc updates). Still moderate complexity.
  * Imports: ./config.js (BUILDING_OVERLOAD_THRESHOLD, MAX_BUILDINGS, GRID_WIDTH, GRID_HEIGHT, BUILDING_COLORS), ./grid.js (isInBounds)
  * Exports: createBuilding, removeBuilding, findBuildingById, findBuildingAtTile, updateBuildingTimers, incrementWaitingCount, decrementWaitingCount, hasOverloadedBuilding, resetOverload, getHousesWithDemand, getDestinations, getDestinationsByColor, spawnHouse, spawnDestination
+ * (No new public exports. All existing signatures and 1-argument call behavior preserved exactly.)
+ */
+
+/**
+ * Phase 1 of remediation plan (prevent houses from spawning on tiles that already have road connections):
+ * - Added private (non-exported) helper tileHasAnyRoadConnection(roads, tile) — O(R) linear scan.
+ * - findRandomEmptyTile now accepts optional second param roads = [].
+ * - spawnHouse and spawnDestination now accept optional second param roads = [] and forward it.
+ * - When roads param is omitted (current main.js call sites), behavior is 100% identical to the version delivered in previous chat.
+ * - Road check is implemented internally with linear scan (no new export or dependency on roads.js yet).
+ * - Future phases will update call sites in main.js to pass state.roads (this file change is isolated and non-breaking).
+ * - Engine-agnostic, plain objects/arrays only, zero per-frame allocations.
  */
 
 // -----------------------------------------------------------------------------
@@ -71,20 +83,47 @@ function setWaitingCount(building, newCount) {
 }
 
 /**
- * Finds a random tile with no building on it.
+ * Returns true if the given tile is used as the 'from' or 'to' of any road in the array.
+ * O(R) linear scan — acceptable because this runs only during infrequent building spawns.
+ * @param {Array<{from: TileCoord, to: TileCoord}>} roads
+ * @param {TileCoord} tile
+ * @returns {boolean}
+ */
+function tileHasAnyRoadConnection(roads, tile) {
+  if (!Array.isArray(roads) || roads.length === 0 || !tile) return false;
+  for (let i = 0; i < roads.length; i++) {
+    const r = roads[i];
+    if (!r || !r.from || !r.to) continue;
+    if ((r.from.x === tile.x && r.from.y === tile.y) ||
+        (r.to.x === tile.x && r.to.y === tile.y)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Finds a random tile with no building on it (and optionally no road connection).
  * Uses limited random sampling (fast early/mid game). Returns null only if grid essentially full.
+ * When roads array is provided and non-empty, any tile that is an endpoint of a road is rejected.
+ * Road check costs O(R) per attempt (R = roads.length) but is only executed during infrequent spawns.
  * @param {Building[]} buildings
+ * @param {Array<{from: TileCoord, to: TileCoord}>} [roads=[]]
  * @returns {TileCoord|null}
  */
-function findRandomEmptyTile(buildings) {
+function findRandomEmptyTile(buildings, roads = []) {
   const maxAttempts = 200;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const x = Math.floor(Math.random() * GRID_WIDTH);
     const y = Math.floor(Math.random() * GRID_HEIGHT);
     const tile = { x, y };
-    if (!findBuildingAtTile(buildings, tile)) {
-      return tile;
+    if (findBuildingAtTile(buildings, tile)) {
+      continue;
     }
+    if (Array.isArray(roads) && roads.length > 0 && tileHasAnyRoadConnection(roads, tile)) {
+      continue;
+    }
+    return tile;
   }
   return null;
 }
@@ -98,6 +137,8 @@ function findRandomEmptyTile(buildings) {
  * Houses start with waitingCount=1 (immediate demand); destinations start at 0.
  * Color is assigned here: if a valid color string is passed as 4th arg, use it; otherwise pick balanced random from the 5 canonical colors.
  * Old buildings without color field (from pre-color createInitialState) are not created here anymore — creation always emits color.
+ * Note: createBuilding itself only enforces no-building-at-tile (plus bounds/max). The optional "no road connection" filter
+ * is applied upstream in findRandomEmptyTile / spawnHouse / spawnDestination when a roads array is passed.
  * @param {Building[]} buildings - target array (usually state.buildings)
  * @param {'house' | 'destination'} type
  * @param {TileCoord} tile
@@ -312,27 +353,33 @@ export function getDestinationsByColor(buildings, color) {
 }
 
 /**
- * Spawn helper: attempts to place a new house at a random empty tile.
+ * Spawn helper: attempts to place a new house at a random empty tile (optionally avoiding road-connected tiles).
  * Uses createBuilding internally (initial waitingCount=1, color auto-assigned).
+ * If roads param is provided and non-empty, only tiles with no building AND no road endpoint are considered.
+ * When roads is omitted (or empty), behaves exactly as before — permissive spawning on any empty tile.
  * @param {Building[]} buildings
+ * @param {Array<{from: TileCoord, to: TileCoord}>} [roads=[]]
  * @returns {Building|null}
  */
-export function spawnHouse(buildings) {
+export function spawnHouse(buildings, roads = []) {
   if (buildings.length >= MAX_BUILDINGS) return null;
-  const tile = findRandomEmptyTile(buildings);
+  const tile = findRandomEmptyTile(buildings, roads);
   if (!tile) return null;
   return createBuilding(buildings, 'house', tile);
 }
 
 /**
- * Spawn helper: attempts to place a new destination at a random empty tile.
+ * Spawn helper: attempts to place a new destination at a random empty tile (optionally avoiding road-connected tiles).
  * Uses createBuilding internally (initial waitingCount=0, color auto-assigned).
+ * If roads param is provided and non-empty, only tiles with no building AND no road endpoint are considered.
+ * When roads is omitted (or empty), behaves exactly as before — permissive spawning on any empty tile.
  * @param {Building[]} buildings
+ * @param {Array<{from: TileCoord, to: TileCoord}>} [roads=[]]
  * @returns {Building|null}
  */
-export function spawnDestination(buildings) {
+export function spawnDestination(buildings, roads = []) {
   if (buildings.length >= MAX_BUILDINGS) return null;
-  const tile = findRandomEmptyTile(buildings);
+  const tile = findRandomEmptyTile(buildings, roads);
   if (!tile) return null;
   return createBuilding(buildings, 'destination', tile);
 }
