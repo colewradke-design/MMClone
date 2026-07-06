@@ -1,8 +1,8 @@
 /**
  * src/vehicles.js
- * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard to eliminate visual jitter from forced progress=0 reset), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking.
- * Expected scale: ~242 LOC (minimal +~8 LOC for guard + comments). Complexity from edge-grouped queue constraints (O(V) build), seamless reroute with occupancy handoff, edge transition, arrival scoring hook.
- * Imports: ./config.js, ./grid.js, ./roads.js, ./buildings.js, ./pathfinding.js
+ * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard to eliminate visual jitter from forced progress=0 reset), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking. Vehicles now carry an optional `color` (darkened hex from origin house) set once at spawn for future visual identity in render. No gameplay, pathing, or movement changes.
+ * Expected scale: ~255 LOC (+~13 LOC for private darken helper + color assignment/reset logic). Zero per-frame allocations or cost added.
+ * Imports: ./config.js (MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS), ./grid.js (getTileDistance), ./roads.js (addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge), ./buildings.js (findBuildingById), ./pathfinding.js (findPath)
  * Exports: findVehicleById, spawnVehicle, deactivateVehicle, updateVehicles
  *
  * -- Defold equivalent: bootstrap + per-vehicle or manager update(dt) with msg routing for occupancy handoff.
@@ -10,15 +10,14 @@
 // -----------------------------------------------------------------------------
 // Imports & module state
 // -----------------------------------------------------------------------------
-
-import { MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE } from './config.js';
+import { MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS } from './config.js';
 import { getTileDistance } from './grid.js';
 import { addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge } from './roads.js';
 import { findBuildingById } from './buildings.js';
 import { findPath } from './pathfinding.js';
 
 /** @typedef {{x: number, y: number}} TileCoord */
-/** @typedef {{id: string, active: boolean, originId: string|null, destinationId: string|null, path: TileCoord[], pathIndex: number, progress: number, speed: number, personality: number, rerouteTimer: number}} Vehicle */
+/** @typedef {{id: string, active: boolean, originId: string|null, destinationId: string|null, path: TileCoord[], pathIndex: number, progress: number, speed: number, personality: number, rerouteTimer: number, color?: string}} Vehicle */
 
 let nextVehicleId = 0;
 
@@ -46,7 +45,8 @@ function createVehicleTemplate() {
     progress: 0,
     speed: 0,
     personality: 0.5,
-    rerouteTimer: 0
+    rerouteTimer: 0,
+    color: undefined
   };
 }
 
@@ -68,6 +68,33 @@ function getNormalizedEdgeKey(from, to) {
     return `${fromKey}-${toKey}`;
   }
   return `${toKey}-${fromKey}`;
+}
+
+/**
+ * Returns a slightly darker version of the given hex color.
+ * Simple RGB-based darkening suitable for prototype use. Keeps output as 6-digit #hex.
+ * Used to give vehicles a distinct but related shade of their spawning house color.
+ * @param {string} hex
+ * @param {number} [factor=0.78]
+ * @returns {string}
+ */
+function darkenHexColor(hex, factor = 0.78) {
+  if (!hex || typeof hex !== 'string') {
+    return COLORS.vehicle || '#2d2d2d';
+  }
+  let c = hex.startsWith('#') ? hex.slice(1) : hex;
+  if (c.length === 3) {
+    c = c.split('').map(ch => ch + ch).join('');
+  }
+  if (c.length !== 6) {
+    return COLORS.vehicle || '#2d2d2d';
+  }
+  const r = Math.max(0, Math.floor(parseInt(c.slice(0, 2), 16) * factor));
+  const g = Math.max(0, Math.floor(parseInt(c.slice(2, 4), 16) * factor));
+  const b = Math.max(0, Math.floor(parseInt(c.slice(4, 6), 16) * factor));
+  return '#' + r.toString(16).padStart(2, '0') +
+         g.toString(16).padStart(2, '0') +
+         b.toString(16).padStart(2, '0');
 }
 
 /**
@@ -95,6 +122,11 @@ export function findVehicleById(vehicles, id) {
  * Computes initial path via findPath; fails (returns null) if no route exists.
  * Adds vehicle to first edge's occupantIds. Caller must decrement house waitingCount.
  * Staggers initial rerouteTimer with random offset.
+ * Color behavior: After locating the origin house, reads its `color` field and stores a
+ * slightly darkened version (via darkenHexColor) on the vehicle instance. This enables
+ * visual identity (which house a car came from) while maintaining contrast on dark roads.
+ * Legacy houses without a color field fall back to COLORS.vehicle. The field is always
+ * (re)set on every spawn/reuse from the pool.
  * @param {Vehicle[]} vehicles
  * @param {string} originId
  * @param {string} destinationId
@@ -114,6 +146,12 @@ export function spawnVehicle(vehicles, originId, destinationId, roads, buildings
   const originTile = { x: originB.tile.x, y: originB.tile.y };
   const destTile = { x: destB.tile.x, y: destB.tile.y };
   if (originTile.x === destTile.x && originTile.y === destTile.y) return null;
+
+  // Determine darkened vehicle color from house color (additive visual identity only)
+  let vehicleColor = COLORS.vehicle || '#2d2d2d';
+  if (originB.color && typeof originB.color === 'string') {
+    vehicleColor = darkenHexColor(originB.color, 0.78);
+  }
 
   // Try to reuse an inactive slot (O(V) scan, but spawn is infrequent ~every 4s)
   let vehicle = null;
@@ -147,6 +185,7 @@ export function spawnVehicle(vehicles, originId, destinationId, roads, buildings
   vehicle.speed = VEHICLE_SPEED;
   vehicle.personality = personality;
   vehicle.rerouteTimer = Math.random() * REROUTE_CHECK_INTERVAL; // stagger checks
+  vehicle.color = vehicleColor; // always set/reset on activation
 
   // Occupy first edge
   addVehicleToEdge(roads, path[0], path[1], vehicle.id);
@@ -157,6 +196,7 @@ export function spawnVehicle(vehicles, originId, destinationId, roads, buildings
 /**
  * Deactivates a vehicle, removes it from any current edge occupancy, clears fields, returns to pool.
  * Safe to call if already inactive. Used by main.js for stranded-vehicle cleanup on road/building removal.
+ * Also clears the color field to keep pool objects clean.
  * @param {Vehicle[]} vehicles
  * @param {Road[]} roads
  * @param {string} id
@@ -181,6 +221,7 @@ export function deactivateVehicle(vehicles, roads, id) {
   v.progress = 0;
   v.speed = 0;
   v.rerouteTimer = 0;
+  v.color = undefined;
   return true;
 }
 
@@ -302,6 +343,7 @@ export function updateVehicles(vehicles, roads, buildings, dt) {
               v.pathIndex = 0;
               v.progress = 0;
               v.speed = 0;
+              v.color = undefined;
               continue;
             }
           }
@@ -322,6 +364,7 @@ export function updateVehicles(vehicles, roads, buildings, dt) {
         v.progress = 0;
         v.speed = 0;
         v.rerouteTimer = 0;
+        v.color = undefined;
       }
       continue;
     }
@@ -371,6 +414,7 @@ export function updateVehicles(vehicles, roads, buildings, dt) {
         v.progress = 0;
         v.speed = 0;
         v.rerouteTimer = 0;
+        v.color = undefined;
       }
     }
   }
