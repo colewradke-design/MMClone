@@ -1,13 +1,14 @@
 /**
  * src/config.js
- * Purpose: Global constants only. No logic, no side effects. All values are engine-agnostic.
- * Expected scale: ~35 LOC. Pure named exports for use across modules.
+ * Purpose: Global constants only. No logic, no side effects. All values are engine-agnostic. Now centralizes BUILDING_COLORS and COLOR_HEX to support building color identity without duplication in other modules.
+ * Expected scale: ~40 LOC. Pure named exports for use across modules.
  * Imports: None
  * Exports: GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, MAX_VEHICLES, MAX_BUILDINGS,
  *          FIXED_TIMESTEP, MAX_FRAME_SKIP, PATHFINDING_MS_BUDGET, MAX_TILES_RECOMPUTE,
  *          REROUTE_CHECK_INTERVAL, VEHICLE_SPEED, VEHICLE_SPAWN_INTERVAL,
  *          BUILDING_SPAWN_INTERVAL, ROAD_EDGE_CAPACITY, ROAD_MIN_SPEED_FACTOR,
- *          VEHICLE_FOLLOW_DISTANCE, BUILDING_OVERLOAD_THRESHOLD, COLORS, SHOW_FPS_COUNTER
+ *          VEHICLE_FOLLOW_DISTANCE, BUILDING_OVERLOAD_THRESHOLD, COLORS, SHOW_FPS_COUNTER,
+ *          BUILDING_COLORS, COLOR_HEX
  */
 
 export const GRID_WIDTH = 48;
@@ -46,3 +47,13 @@ export const COLORS = {
 };
 
 export const SHOW_FPS_COUNTER = true;
+
+export const BUILDING_COLORS = ['red', 'blue', 'green', 'yellow', 'purple'];
+
+export const COLOR_HEX = {
+  red: '#e74c3c',
+  blue: '#3498db',
+  green: '#2ecc71',
+  yellow: '#f1c40f',
+  purple: '#9b59b6'
+};
