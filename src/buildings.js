@@ -1,20 +1,20 @@
 /**
  * src/buildings.js
- * Purpose: Building creation/removal, spawn helpers (random empty tile placement), supply/demand (waitingCount) management, wait timer increments and overload state transitions. Owns all Building data mutations and queries for the house/destination model. Overload flag is sticky (see resetOverload).
- * Expected scale: ~135 LOC. Moderate complexity from tile occupancy checks, timer side-effects, sticky overload, and spawn sampling.
- * Imports: ./config.js (BUILDING_OVERLOAD_THRESHOLD, MAX_BUILDINGS, GRID_WIDTH, GRID_HEIGHT), ./grid.js (isInBounds)
- * Exports: createBuilding, removeBuilding, findBuildingById, findBuildingAtTile, updateBuildingTimers, incrementWaitingCount, decrementWaitingCount, hasOverloadedBuilding, resetOverload, getHousesWithDemand, getDestinations, spawnHouse, spawnDestination
+ * Purpose: Building creation/removal, spawn helpers (random empty tile placement), supply/demand (waitingCount) management, wait timer increments and overload state transitions. Color assignment added to creation (random balanced from 5 colors or explicit valid value). Owns all Building data mutations and queries for the house/destination model. Overload flag is sticky (see resetOverload).
+ * Expected scale: ~145 LOC. Added color handling in createBuilding + new getDestinationsByColor query (~10 LOC growth). Moderate complexity from tile occupancy checks, timer side-effects, sticky overload, and spawn sampling.
+ * Imports: ./config.js (BUILDING_OVERLOAD_THRESHOLD, MAX_BUILDINGS, GRID_WIDTH, GRID_HEIGHT, BUILDING_COLORS), ./grid.js (isInBounds)
+ * Exports: createBuilding, removeBuilding, findBuildingById, findBuildingAtTile, updateBuildingTimers, incrementWaitingCount, decrementWaitingCount, hasOverloadedBuilding, resetOverload, getHousesWithDemand, getDestinations, getDestinationsByColor, spawnHouse, spawnDestination
  */
 
 // -----------------------------------------------------------------------------
 // Imports & module state
 // -----------------------------------------------------------------------------
 
-import { BUILDING_OVERLOAD_THRESHOLD, MAX_BUILDINGS, GRID_WIDTH, GRID_HEIGHT } from './config.js';
+import { BUILDING_OVERLOAD_THRESHOLD, MAX_BUILDINGS, GRID_WIDTH, GRID_HEIGHT, BUILDING_COLORS } from './config.js';
 import { isInBounds } from './grid.js';
 
 /** @typedef {{x: number, y: number}} TileCoord */
-/** @typedef {{id: string, type: 'house' | 'destination', tile: TileCoord, waitingCount: number, waitTimer: number, overloaded: boolean}} Building */
+/** @typedef {{id: string, type: 'house' | 'destination', tile: TileCoord, waitingCount: number, waitTimer: number, overloaded: boolean, color?: 'red' | 'blue' | 'green' | 'yellow' | 'purple'}} Building */
 
 let nextBuildingId = 0;
 
@@ -96,12 +96,15 @@ function findRandomEmptyTile(buildings) {
 /**
  * Creates and appends a new Building if tile is valid, in-bounds, unoccupied, and under MAX_BUILDINGS.
  * Houses start with waitingCount=1 (immediate demand); destinations start at 0.
+ * Color is assigned here: if a valid color string is passed as 4th arg, use it; otherwise pick balanced random from the 5 canonical colors.
+ * Old buildings without color field (from pre-color createInitialState) are not created here anymore — creation always emits color.
  * @param {Building[]} buildings - target array (usually state.buildings)
  * @param {'house' | 'destination'} type
  * @param {TileCoord} tile
+ * @param {'red'|'blue'|'green'|'yellow'|'purple'} [color] - optional explicit color
  * @returns {Building|null} newly created building or null on invalid/duplicate/full
  */
-export function createBuilding(buildings, type, tile) {
+export function createBuilding(buildings, type, tile, color) {
   if (type !== 'house' && type !== 'destination') {
     return null;
   }
@@ -115,13 +118,20 @@ export function createBuilding(buildings, type, tile) {
     return null;
   }
 
+  // Color assignment (defensive + requirement)
+  let assignedColor = color;
+  if (!assignedColor || typeof assignedColor !== 'string' || !BUILDING_COLORS.includes(assignedColor)) {
+    assignedColor = BUILDING_COLORS[Math.floor(Math.random() * BUILDING_COLORS.length)];
+  }
+
   const building = {
     id: generateBuildingId(),
     type,
     tile: { x: tile.x, y: tile.y },
     waitingCount: (type === 'house' ? 1 : 0),
     waitTimer: 0,
-    overloaded: false
+    overloaded: false,
+    color: assignedColor
   };
 
   buildings.push(building);
@@ -246,6 +256,7 @@ export function resetOverload(buildings, id) {
  * Returns houses that currently have unmet demand and are not overloaded.
  * Useful for supply/demand matching and vehicle spawn decisions (caller picks from list).
  * Note: a house that previously overloaded will still appear here only if !overloaded (but sticky overload prevents re-use until reset).
+ * Color is ignored (houses may have any color; demand matching does not filter by color).
  * @param {Building[]} buildings
  * @returns {Building[]}
  */
@@ -262,6 +273,7 @@ export function getHousesWithDemand(buildings) {
 
 /**
  * Returns all destination-type buildings (for destination selection in matching/spawn).
+ * Color is not filtered here; use getDestinationsByColor when color-specific matching is required.
  * @param {Building[]} buildings
  * @returns {Building[]}
  */
@@ -276,8 +288,32 @@ export function getDestinations(buildings) {
 }
 
 /**
+ * Returns only destination buildings whose color matches the given color.
+ * Defensive: if a destination somehow lacks color field (legacy data), it is treated as 'red'.
+ * @param {Building[]} buildings
+ * @param {'red'|'blue'|'green'|'yellow'|'purple'} color
+ * @returns {Building[]}
+ */
+export function getDestinationsByColor(buildings, color) {
+  const result = [];
+  if (!color || typeof color !== 'string') return result;
+  if (!BUILDING_COLORS.includes(color)) return result;
+
+  for (let i = 0; i < buildings.length; i++) {
+    const b = buildings[i];
+    if (b.type === 'destination') {
+      const bColor = b.color || 'red'; // graceful fallback for pre-color buildings
+      if (bColor === color) {
+        result.push(b);
+      }
+    }
+  }
+  return result;
+}
+
+/**
  * Spawn helper: attempts to place a new house at a random empty tile.
- * Uses createBuilding internally (initial waitingCount=1).
+ * Uses createBuilding internally (initial waitingCount=1, color auto-assigned).
  * @param {Building[]} buildings
  * @returns {Building|null}
  */
@@ -290,7 +326,7 @@ export function spawnHouse(buildings) {
 
 /**
  * Spawn helper: attempts to place a new destination at a random empty tile.
- * Uses createBuilding internally (initial waitingCount=0).
+ * Uses createBuilding internally (initial waitingCount=0, color auto-assigned).
  * @param {Building[]} buildings
  * @returns {Building|null}
  */
