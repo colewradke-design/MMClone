@@ -32,6 +32,7 @@ import { GRID_WIDTH, GRID_HEIGHT } from './config.js';
  * @property {number} waitingCount      // current unmet demand count
  * @property {number} waitTimer         // seconds since oldest wait started (for overload)
  * @property {boolean} overloaded
+ * @property {'red' | 'blue' | 'green' | 'yellow' | 'purple'} color
  */
 
 /**
@@ -131,7 +132,19 @@ export async function loadGameState() {
     const request = store.get(SAVE_KEY);
 
     request.onsuccess = (event) => {
-      resolve(event.target.result || null);
+      const result = event.target.result || null;
+      // Migration for color identity: any loaded Building missing `color` (pre-color saves)
+      // gets default 'red'. This keeps old sessions playable without crashing on shape mismatch.
+      // New buildings created via createInitialState still omit color (per task constraints).
+      if (result && Array.isArray(result.buildings)) {
+        for (let i = 0; i < result.buildings.length; i++) {
+          const b = result.buildings[i];
+          if (b && typeof b.color === 'undefined') {
+            b.color = 'red';
+          }
+        }
+      }
+      resolve(result);
     };
     request.onerror = (event) => reject(event.target.error);
   });
