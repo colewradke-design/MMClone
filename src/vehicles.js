@@ -1,9 +1,11 @@
 /**
  * src/vehicles.js
- * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking.
- * Expected scale: ~240 LOC. Complexity from edge-grouped queue constraints (O(V) build), seamless-ish reroute with occupancy handoff, edge transition, arrival scoring hook.
+ * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard to eliminate visual jitter from forced progress=0 reset), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking.
+ * Expected scale: ~242 LOC (minimal +~8 LOC for guard + comments). Complexity from edge-grouped queue constraints (O(V) build), seamless reroute with occupancy handoff, edge transition, arrival scoring hook.
  * Imports: ./config.js, ./grid.js, ./roads.js, ./buildings.js, ./pathfinding.js
  * Exports: findVehicleById, spawnVehicle, deactivateVehicle, updateVehicles
+ *
+ * -- Defold equivalent: bootstrap + per-vehicle or manager update(dt) with msg routing for occupancy handoff.
  */
 
 // -----------------------------------------------------------------------------
@@ -190,7 +192,7 @@ export function deactivateVehicle(vehicles, roads, id) {
  * - Per-edge same-direction queueing: groups vehicles, clamps progress behind leader (VEHICLE_FOLLOW_DISTANCE)
  * - Edge transitions: remove from old edge, advance pathIndex, add to new edge, handle arrival
  * - On arrival: recycle to pool, return +1 delivery count for main.js to apply to score
- * Per-frame complexity: O(V) build groups + O(V) updates + O(V × R) from getSpeedFactorForEdge calls (R = roads.length via internal findRoadBetween linear scan). Reroutes amortized & staggered.
+ * Per-frame complexity: O(V) build groups + O(V) updates + O(V × R) from getSpeedFactorForEdge calls (R = roads.length via internal findRoadBetween linear scan). Reroutes amortized & staggered (now guarded on low progress to avoid mid-edge snaps; cost unchanged).
  * -- Defold equivalent: update(dt) on a script/component attached to vehicle instances or a manager
  * @param {Vehicle[]} vehicles
  * @param {Road[]} roads
@@ -263,35 +265,46 @@ export function updateVehicles(vehicles, roads, buildings, dt) {
         const goalTile = destB.tile;
 
         if (currentTile.x !== goalTile.x || currentTile.y !== goalTile.y) {
-          // Remove from current edge to keep occupancy correct before replan
-          let wasOnEdge = false;
-          let oldFrom = null;
-          let oldTo = null;
-          if (v.pathIndex < v.path.length - 1) {
-            wasOnEdge = true;
-            oldFrom = v.path[v.pathIndex];
-            oldTo = v.path[v.pathIndex + 1];
-            removeVehicleFromEdge(roads, oldFrom, oldTo, v.id);
-          }
-
-          const newPath = findPath(roads, currentTile, goalTile, v.personality);
-          if (newPath && newPath.length > 0) {
-            v.path = newPath;
-            v.pathIndex = 0;
-            v.progress = 0;
-            if (newPath.length > 1) {
-              addVehicleToEdge(roads, newPath[0], newPath[1], v.id);
+          // Guard against mid-edge reroute jitter: only allow full path reset (pathIndex=0, progress=0)
+          // when progress is low (near tile center). Mid-edge (high progress) defers the replan.
+          // This keeps render.js linear interpolation smooth; reroute still fires on schedule and
+          // succeeds on subsequent checks when vehicle is near a tile (after edge transitions reset progress=0).
+          // Threshold chosen conservatively small so any allowed jump is visually negligible.
+          // -- Defold equivalent: same guard logic inside vehicle/manager update(dt)
+          const onActiveEdge = v.pathIndex < v.path.length - 1;
+          if (onActiveEdge && v.progress > 0.12) {
+            // defer — current edge occupancy + progress preserved; will retry after full interval
+          } else {
+            // Remove from current edge to keep occupancy correct before replan
+            let wasOnEdge = false;
+            let oldFrom = null;
+            let oldTo = null;
+            if (onActiveEdge) {
+              wasOnEdge = true;
+              oldFrom = v.path[v.pathIndex];
+              oldTo = v.path[v.pathIndex + 1];
+              removeVehicleFromEdge(roads, oldFrom, oldTo, v.id);
             }
-          } else if (wasOnEdge) {
-            // No route after congestion change — safest to recycle
-            v.active = false;
-            v.originId = null;
-            v.destinationId = null;
-            v.path = [];
-            v.pathIndex = 0;
-            v.progress = 0;
-            v.speed = 0;
-            continue;
+
+            const newPath = findPath(roads, currentTile, goalTile, v.personality);
+            if (newPath && newPath.length > 0) {
+              v.path = newPath;
+              v.pathIndex = 0;
+              v.progress = 0;
+              if (newPath.length > 1) {
+                addVehicleToEdge(roads, newPath[0], newPath[1], v.id);
+              }
+            } else if (wasOnEdge) {
+              // No route after congestion change — safest to recycle
+              v.active = false;
+              v.originId = null;
+              v.destinationId = null;
+              v.path = [];
+              v.pathIndex = 0;
+              v.progress = 0;
+              v.speed = 0;
+              continue;
+            }
           }
         }
       }
