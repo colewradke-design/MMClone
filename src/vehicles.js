@@ -7,7 +7,6 @@
  *
  * -- Defold equivalent: bootstrap + per-vehicle or manager update(dt) with msg routing for occupancy handoff.
  */
-
 // -----------------------------------------------------------------------------
 // Imports & module state
 // -----------------------------------------------------------------------------
