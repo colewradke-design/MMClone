@@ -1,8 +1,8 @@
 /**
  * src/main.js
- * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself.
- * Expected scale: ~200 LOC (small growth from tap-to-delete helper + gesture flag). Timing/accumulator logic, spawn orchestration, and lifecycle glue.
- * Imports: ./config.js, ./state.js, ./roads.js, ./buildings.js, ./vehicles.js, ./render.js, ./input.js
+ * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Now also owns dynamic playable-area growth and Mini Motorways-style color-district introduction (1 dest + 2 houses per new color).
+ * Expected scale: ~265 LOC (growth from playable rect state + 3 local helpers + color-introduction logic + density expansion + input guards; original structure and all non-spawn comments preserved).
+ * Imports: ./config.js (FIXED_TIMESTEP, MAX_FRAME_SKIP, VEHICLE_SPAWN_INTERVAL, BUILDING_SPAWN_INTERVAL, GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, SHOW_FPS_COUNTER, BUILDING_COLORS), ./state.js (createInitialState, saveGameState, loadGameState), ./roads.js (createRoad, removeRoad, findRoadBetween, invalidateEdgeMap), ./buildings.js (createBuilding, findBuildingAtTile, updateBuildingTimers, getHousesWithDemand, getDestinations, getDestinationsByColor, spawnHouse, spawnDestination, hasOverloadedBuilding, decrementWaitingCount, incrementWaitingCount), ./vehicles.js (spawnVehicle, updateVehicles), ./render.js (render), ./input.js (initInput)
  * Exports: None (executes setup on module evaluation / DOM ready)
  *
  * -- Defold equivalent: bootstrap `main.script` + `update(self, dt)` with `msg.post` for input; `init` for load/start.
@@ -20,7 +20,8 @@ import {
   GRID_WIDTH,
   GRID_HEIGHT,
   TILE_SIZE,
-  SHOW_FPS_COUNTER
+  SHOW_FPS_COUNTER,
+  BUILDING_COLORS
 } from './config.js';
 
 import {
@@ -37,6 +38,8 @@ import {
 } from './roads.js';
 
 import {
+  createBuilding,
+  findBuildingAtTile,
   updateBuildingTimers,
   getHousesWithDemand,
   getDestinations,
@@ -81,6 +84,155 @@ const AUTO_SAVE_INTERVAL = 10; // seconds
 const HOUSE_DEMAND_REGEN_INTERVAL = 8; // seconds — balancing decision (see Assumptions made)
 
 // -----------------------------------------------------------------------------
+// Mini Motorways color-district model + dynamic playable area (main.js only)
+// - Color Introduction Event (≈30% when timer fires): pick fresh color → place 1 destination + exactly 2 houses of that color inside playable rect.
+// - Houses of a color may only be spawned after at least one destination of that color exists (enforced here; vehicle spawn already uses getDestinationsByColor).
+// - Playable rect starts as centered 10×10; expands by 5 tiles in each direction when ≥40% of its tiles are occupied (buildings + road endpoints). All building placement and road creation confined to playable.
+// - On loaded games: unlockedColors populated from existing destinations; playable set to full grid (unrestricted continuation).
+// - Initial seeding (new game / restart): 1–2 color-introduction events inside the small starting playable area.
+// - unlockedColors + playable bounds are module-local only (no GameState shape change).
+// -----------------------------------------------------------------------------
+
+let playableMinX = 19;
+let playableMinY = 19;
+let playableMaxX = 28;
+let playableMaxY = 28;
+let unlockedColors = new Set();
+
+/**
+ * Resets playable rectangle to the initial centered 10×10 and clears the set of unlocked colors.
+ * Called on brand-new sessions and on restartGame.
+ */
+function resetPlayableArea() {
+  playableMinX = Math.floor((GRID_WIDTH - 10) / 2);
+  playableMinY = Math.floor((GRID_HEIGHT - 10) / 2);
+  playableMaxX = playableMinX + 9;
+  playableMaxY = playableMinY + 9;
+  unlockedColors = new Set();
+}
+
+/**
+ * Returns true if the given tile lies inside the current playable rectangle (inclusive).
+ * Used to confine building spawns and road drawing.
+ * @param {{x:number, y:number}} tile
+ * @returns {boolean}
+ */
+function isInPlayable(tile) {
+  if (!tile) return false;
+  return tile.x >= playableMinX && tile.x <= playableMaxX &&
+         tile.y >= playableMinY && tile.y <= playableMaxY;
+}
+
+/**
+ * Samples random tiles exclusively inside the current playable rectangle and returns the first empty one (no building present).
+ * Uses the already-exported findBuildingAtTile. Returns null after reasonable attempts if the playable area is full.
+ * @param {Building[]} buildings
+ * @returns {{x:number, y:number}|null}
+ */
+function findRandomEmptyInPlayable(buildings) {
+  const w = playableMaxX - playableMinX + 1;
+  const h = playableMaxY - playableMinY + 1;
+  const maxAttempts = Math.min(300, w * h * 2);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const x = playableMinX + Math.floor(Math.random() * w);
+    const y = playableMinY + Math.floor(Math.random() * h);
+    const tile = { x, y };
+    if (!findBuildingAtTile(buildings, tile)) {
+      return tile;
+    }
+  }
+  return null;
+}
+
+/**
+ * Performs one Mini Motorways-style color-introduction event inside the current playable area:
+ * picks an unused color, places exactly one destination of that color, then places exactly two houses of the same color
+ * (biased toward clustering near the new destination, falling back to any empty playable tile).
+ * Adds the color to unlockedColors on success. Returns true only if the destination was successfully created.
+ * @param {Building[]} buildings
+ * @returns {boolean}
+ */
+function performColorIntroduction(buildings) {
+  const available = BUILDING_COLORS.filter(c => !unlockedColors.has(c));
+  if (available.length === 0) return false;
+
+  const newColor = available[Math.floor(Math.random() * available.length)];
+
+  const destTile = findRandomEmptyInPlayable(buildings);
+  if (!destTile) return false;
+
+  const dest = createBuilding(buildings, 'destination', destTile, newColor);
+  if (!dest) return false;
+
+  unlockedColors.add(newColor);
+
+  // Try to cluster the two houses near the new destination (small radius first)
+  let housesPlaced = 0;
+  const radius = 4;
+  for (let attempt = 0; attempt < 50 && housesPlaced < 2; attempt++) {
+    let hx = destTile.x + Math.floor(Math.random() * (radius * 2 + 1)) - radius;
+    let hy = destTile.y + Math.floor(Math.random() * (radius * 2 + 1)) - radius;
+    hx = Math.max(playableMinX, Math.min(playableMaxX, hx));
+    hy = Math.max(playableMinY, Math.min(playableMaxY, hy));
+    const hTile = { x: hx, y: hy };
+    if (!findBuildingAtTile(buildings, hTile)) {
+      const h = createBuilding(buildings, 'house', hTile, newColor);
+      if (h) housesPlaced++;
+    }
+  }
+
+  // Fallback: place any remaining houses anywhere in playable area
+  while (housesPlaced < 2) {
+    const hTile = findRandomEmptyInPlayable(buildings);
+    if (!hTile) break;
+    const h = createBuilding(buildings, 'house', hTile, newColor);
+    if (h) housesPlaced++;
+    else break;
+  }
+
+  console.log(`[main] New color district introduced: ${newColor} (1 destination + ${housesPlaced} houses)`);
+  return true;
+}
+
+/**
+ * Computes the fraction of playable-area tiles that are occupied (have a building OR are an endpoint of any road).
+ * If density ≥ 0.40, expands the playable rectangle by 5 tiles in every direction (clamped to grid bounds) and logs once.
+ * Called every fixed-timestep tick (cost is trivial: O(B + R) with a small Set).
+ * @param {Building[]} buildings
+ * @param {Road[]} roads
+ */
+function checkDensityAndExpandIfNeeded(buildings, roads) {
+  const occupied = new Set();
+  for (let i = 0; i < buildings.length; i++) {
+    const b = buildings[i];
+    if (isInPlayable(b.tile)) {
+      occupied.add(`${b.tile.x},${b.tile.y}`);
+    }
+  }
+  for (let i = 0; i < roads.length; i++) {
+    const r = roads[i];
+    if (r.from && isInPlayable(r.from)) occupied.add(`${r.from.x},${r.from.y}`);
+    if (r.to && isInPlayable(r.to)) occupied.add(`${r.to.x},${r.to.y}`);
+  }
+
+  const playableW = playableMaxX - playableMinX + 1;
+  const playableH = playableMaxY - playableMinY + 1;
+  if (playableW <= 0 || playableH <= 0) return;
+
+  const density = occupied.size / (playableW * playableH);
+  if (density >= 0.40) {
+    const oldMinX = playableMinX;
+    playableMinX = Math.max(0, playableMinX - 5);
+    playableMinY = Math.max(0, playableMinY - 5);
+    playableMaxX = Math.min(GRID_WIDTH - 1, playableMaxX + 5);
+    playableMaxY = Math.min(GRID_HEIGHT - 1, playableMaxY + 5);
+    if (playableMinX !== oldMinX) {
+      console.log(`[main] Playable area expanded → ${playableMinX}..${playableMaxX}, ${playableMinY}..${playableMaxY} (density ${(density * 100).toFixed(1)}%)`);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Internal functions
 // -----------------------------------------------------------------------------
 
@@ -88,6 +240,7 @@ const HOUSE_DEMAND_REGEN_INTERVAL = 8; // seconds — balancing decision (see As
  * Performs one fixed-timestep simulation step.
  * Order: timers → loss check → vehicles (deliveries) → spawns → periodic save.
  * Freezes further simulation once gameOver is set (next tick returns early).
+ * Density/expansion check runs at end of every tick while playing.
  * @param {number} dt - fixed timestep in seconds
  */
 function updateSimulation(dt) {
@@ -141,14 +294,33 @@ function updateSimulation(dt) {
     }
   }
 
-  // Building spawning (balanced toward houses)
+  // Building spawning — now uses controlled color-district introduction + unlocked-color normal spawns
   buildingSpawnTimer += dt;
   if (buildingSpawnTimer >= BUILDING_SPAWN_INTERVAL) {
     buildingSpawnTimer -= BUILDING_SPAWN_INTERVAL;
-    if (Math.random() < 0.65) {
-      spawnHouse(state.buildings);
+
+    const hasUnlocked = unlockedColors.size > 0;
+
+    if (!hasUnlocked || Math.random() < 0.30) {
+      // Color-introduction event (Mini Motorways district spawn)
+      performColorIntroduction(state.buildings);
+    } else if (hasUnlocked) {
+      // Normal spawn using only already-unlocked colors (a destination of that color already exists)
+      const colorList = Array.from(unlockedColors);
+      if (colorList.length > 0) {
+        const chosenColor = colorList[Math.floor(Math.random() * colorList.length)];
+        const tile = findRandomEmptyInPlayable(state.buildings);
+        if (tile) {
+          if (Math.random() < 0.65) {
+            createBuilding(state.buildings, 'house', tile, chosenColor);
+          } else {
+            createBuilding(state.buildings, 'destination', tile, chosenColor);
+          }
+        }
+      }
     } else {
-      spawnDestination(state.buildings);
+      // Fallback (should rarely happen after initial seeding)
+      performColorIntroduction(state.buildings);
     }
   }
 
@@ -173,6 +345,9 @@ function updateSimulation(dt) {
       }
     }
   }
+
+  // Density check & playable expansion (runs every fixed tick while playing)
+  checkDensityAndExpandIfNeeded(state.buildings, state.roads);
 
   // Periodic autosave (non-blocking, only while playing)
   if (!state.gameOver) {
@@ -227,6 +402,7 @@ function gameLoop(now = performance.now()) {
  * Restarts the game to a fresh session.
  * Discards previous state entirely (new arrays, reset timers, initial buildings).
  * Calls invalidateEdgeMap because roads reference is replaced.
+ * Resets playable area to initial 10×10 and performs 1–2 color-introduction events.
  */
 function restartGame() {
   if (!state) return;
@@ -234,12 +410,12 @@ function restartGame() {
   state = createInitialState();
   invalidateEdgeMap(); // call site #2: after createInitialState on restart
 
-  // Seed a playable starting position
-  for (let i = 0; i < 5; i++) {
-    spawnHouse(state.buildings);
-  }
-  for (let i = 0; i < 3; i++) {
-    spawnDestination(state.buildings);
+  resetPlayableArea();
+
+  // Seed a playable starting position using color-district introduction (1 dest + 2 houses per color)
+  performColorIntroduction(state.buildings);
+  if (Math.random() < 0.6) {
+    performColorIntroduction(state.buildings);
   }
 
   vehicleSpawnTimer = 0;
@@ -286,11 +462,30 @@ async function initGame() {
 
   if (loadedState && Array.isArray(loadedState.roads) && Array.isArray(loadedState.buildings) && Array.isArray(loadedState.vehicles)) {
     state = loadedState;
+
+    // Populate unlockedColors from any existing destination buildings (supports old saves)
+    unlockedColors = new Set();
+    for (let i = 0; i < state.buildings.length; i++) {
+      const b = state.buildings[i];
+      if (b && b.type === 'destination' && b.color && BUILDING_COLORS.includes(b.color)) {
+        unlockedColors.add(b.color);
+      }
+    }
+
+    // Loaded/continued sessions run unrestricted on the full grid
+    playableMinX = 0;
+    playableMinY = 0;
+    playableMaxX = GRID_WIDTH - 1;
+    playableMaxY = GRID_HEIGHT - 1;
   } else {
     state = createInitialState();
-    // Seed initial buildings only for brand-new sessions
-    for (let i = 0; i < 5; i++) spawnHouse(state.buildings);
-    for (let i = 0; i < 3; i++) spawnDestination(state.buildings);
+    resetPlayableArea();
+
+    // Seed initial playable district(s) — one or two color-introduction events inside the small starting 10×10 area
+    performColorIntroduction(state.buildings);
+    if (Math.random() < 0.6) {
+      performColorIntroduction(state.buildings);
+    }
   }
 
   invalidateEdgeMap(); // call site #1: after any loadGameState() or createInitialState() that sets state.roads
@@ -328,6 +523,7 @@ async function initGame() {
   // Wire input (tile coords only; handlers close over mutable state binding)
   initInput(canvas, {
     onRoadToggle: (from, to) => {
+      if (!isInPlayable(from) || !isInPlayable(to)) return; // confine road drawing to playable area
       roadEditThisGesture = true; // any invocation means this was a drag gesture (not a pure tap)
       if (!state || state.gameOver) return;
       if (!findRoadBetween(state.roads, from, to)) {
@@ -352,11 +548,13 @@ async function initGame() {
         // This is rare in normal play and matches the conservative interpretation allowed by the spec.
         // Safety: only remove if the road has zero occupants (never strands a vehicle mid-edge).
         // If tile has multiple roads we remove only the first unoccupied match (simple & predictable).
-        const roadToDelete = findFirstUnoccupiedRoadAtTile(state.roads, tile);
-        if (roadToDelete) {
-          removeRoad(state.roads, roadToDelete.from, roadToDelete.to);
-          // removeRoad already maintains the internal edgeMap; no invalidateEdgeMap() call required
-          // (invalidate is only for cases where the entire roads array reference is replaced).
+        if (isInPlayable(tile)) { // confine tap-to-delete to playable area
+          const roadToDelete = findFirstUnoccupiedRoadAtTile(state.roads, tile);
+          if (roadToDelete) {
+            removeRoad(state.roads, roadToDelete.from, roadToDelete.to);
+            // removeRoad already maintains the internal edgeMap; no invalidateEdgeMap() call required
+            // (invalidate is only for cases where the entire roads array reference is replaced).
+          }
         }
       }
 
