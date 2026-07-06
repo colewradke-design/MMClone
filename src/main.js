@@ -1,7 +1,7 @@
 /**
  * src/main.js
- * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Includes bounded retry pairing fix (MAX_PAIRING_ATTEMPTS local const) for reliable vehicle spawns on connected house-dest pairs.
- * Expected scale: ~205 LOC (small growth from tap-to-delete helper + gesture flag + spawn pairing retry fix). Timing/accumulator logic, spawn orchestration, and lifecycle glue.
+ * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself.
+ * Expected scale: ~200 LOC (small growth from tap-to-delete helper + gesture flag). Timing/accumulator logic, spawn orchestration, and lifecycle glue.
  * Imports: ./config.js, ./state.js, ./roads.js, ./buildings.js, ./vehicles.js, ./render.js, ./input.js
  * Exports: None (executes setup on module evaluation / DOM ready)
  *
@@ -40,6 +40,7 @@ import {
   updateBuildingTimers,
   getHousesWithDemand,
   getDestinations,
+  getDestinationsByColor,
   spawnHouse,
   spawnDestination,
   hasOverloadedBuilding,
@@ -115,16 +116,15 @@ function updateSimulation(dt) {
   if (vehicleSpawnTimer >= VEHICLE_SPAWN_INTERVAL) {
     vehicleSpawnTimer -= VEHICLE_SPAWN_INTERVAL;
     const houses = getHousesWithDemand(state.buildings);
-    const dests = getDestinations(state.buildings);
-    if (houses.length > 0 && dests.length > 0) {
-      // Bounded retry pairing: attempt up to MAX_PAIRING_ATTEMPTS random house+dest pairs
-      // (preserving same-id guard) until spawnVehicle succeeds (i.e. a valid path exists).
-      // Cold path (~every 4s): O(attempts) with attempts<=8 is negligible; avoids spawning
-      // on unreachable pairs which was the root cause of silent no-spawn.
-      const MAX_PAIRING_ATTEMPTS = 8;
-      let spawned = false;
-      for (let attempt = 0; attempt < MAX_PAIRING_ATTEMPTS && !spawned; attempt++) {
-        const house = houses[Math.floor(Math.random() * houses.length)];
+    if (houses.length > 0) {
+      const house = houses[Math.floor(Math.random() * houses.length)];
+      // Color-matching spawn rule (color identity system):
+      // Houses only send vehicles to destinations whose color exactly matches the house color.
+      // We replace the previous global getDestinations() with the color-filtered query.
+      // If the randomly chosen house has zero matching-color destinations, we skip spawning
+      // this tick entirely (the house retains its waitingCount/demand).
+      const dests = getDestinationsByColor(state.buildings, house.color);
+      if (dests.length > 0) {
         let dest = dests[Math.floor(Math.random() * dests.length)];
         // avoid self if somehow same id (not possible by type)
         if (house.id === dest.id && dests.length > 1) {
@@ -134,11 +134,10 @@ function updateSimulation(dt) {
           const vehicle = spawnVehicle(state.vehicles, house.id, dest.id, state.roads, state.buildings);
           if (vehicle) {
             decrementWaitingCount(state.buildings, house.id);
-            spawned = true;
           }
         }
       }
-      // If no successful pairing after MAX_PAIRING_ATTEMPTS attempts, no vehicle is spawned this tick.
+      // else: no matching-color destination for this house — skip spawn, demand retained
     }
   }
 
