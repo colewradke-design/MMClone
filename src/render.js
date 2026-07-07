@@ -1,7 +1,7 @@
 /**
  * src/render.js
- * Purpose: Canvas2D rendering of game state (grid, roads with congestion coloring, buildings with overload state, vehicles positioned via progress interpolation with simple car shape, score/FPS/game-over UI). Only module allowed to call Canvas APIs. Reads state + query helpers; no mutations or game logic.
- * Expected scale: ~135 LOC (allocation fixes reduced a helper). O(R+B+V) per frame explicitly flagged.
+ * Purpose: Canvas2D rendering of game state (grid, roads with congestion coloring, buildings with overload state, vehicles positioned via progress interpolation with simple car shape now using per-vehicle `color` (darkened house color) with fallback to COLORS.vehicle, score/FPS/game-over UI). Only module allowed to call Canvas APIs. Reads state + query helpers; no mutations or game logic.
+ * Expected scale: ~138 LOC (+3 LOC for color fallback in drawVehicle). O(R+B+V) per frame explicitly flagged.
  * Imports: ./config.js (COLORS, TILE_SIZE, GRID_WIDTH, GRID_HEIGHT, SHOW_FPS_COUNTER), ./roads.js (getSpeedFactor)
  * Exports: render
  *
@@ -16,8 +16,7 @@ import { getSpeedFactor } from './roads.js';
 /** @typedef {{x: number, y: number}} TileCoord */
 /** @typedef {{id: string, from: TileCoord, to: TileCoord, capacity: number, occupantIds: string[]}} Road */
 /** @typedef {{id: string, type: 'house'|'destination', tile: TileCoord, waitingCount: number, waitTimer: number, overloaded: boolean, color?: 'red'|'blue'|'green'|'yellow'|'purple'}} Building */
-/** @typedef {{id: string, active: boolean, originId: string|null, destinationId: string|null, path: TileCoord[], pathIndex: number, progress: number, speed: number, personality: number, rerouteTimer: number}} Vehicle */
-// -----------------------------------------------------------------------------
+/** @typedef {{id: string, active: boolean, originId: string|null, destinationId: string|null, path: TileCoord[], pathIndex: number, progress: number, speed: number, personality: number, rerouteTimer: number, color?: string}} Vehicle */// -----------------------------------------------------------------------------
 // Allocation-free scratch objects (RULES.md §11 compliance)
 // Reused across all draw calls. Safe because usage is synchronous and immediate
 // (compute → draw with values → next iteration overwrites).
@@ -42,8 +41,8 @@ function writeTileCenter(tile, out) {
 // -----------------------------------------------------------------------------
 /**
  * Draws faint grid lines for tile boundaries.
- * @param {CanvasRenderingContext2D} ctx
- */
+ * Vehicle body now uses vehicle.color (darkened house color) when present, with fallback to COLORS.vehicle. */
+
 function drawGridLines(ctx) {
   const gridPixelWidth = GRID_WIDTH * TILE_SIZE;
   const gridPixelHeight = GRID_HEIGHT * TILE_SIZE;
@@ -154,8 +153,7 @@ function drawVehicle(ctx, vehicle) {
   if (vehicle.pathIndex >= vehicle.path.length - 1) {
     // arrived / final tile — simple dot (reuse scratch)
     writeTileCenter(vehicle.path[vehicle.path.length - 1], _p1);
-    ctx.fillStyle = COLORS.vehicle;
-    ctx.beginPath();
+    ctx.fillStyle = vehicle.color || COLORS.vehicle;    ctx.beginPath();
     ctx.arc(_p1.x, _p1.y, 5, 0, Math.PI * 2);
     ctx.fill();
     return;
@@ -172,9 +170,8 @@ function drawVehicle(ctx, vehicle) {
   ctx.translate(posX, posY);
   const angle = Math.atan2(_p2.y - _p1.y, _p2.x - _p1.x);
   ctx.rotate(angle);
-  // Car body (dark)
-  ctx.fillStyle = COLORS.vehicle;
-  ctx.fillRect(-7, -3.5, 14, 7);
+// Car body (now uses per-vehicle color when available)
+  ctx.fillStyle = vehicle.color || COLORS.vehicle;  ctx.fillRect(-7, -3.5, 14, 7);
   // Front windshield accent
   ctx.fillStyle = '#4a4a4a';
   ctx.fillRect(1, -2.5, 5, 5);
@@ -256,8 +253,7 @@ export function render(ctx, state, fps = 0) {
   if (Array.isArray(state.buildings)) {
     drawBuildings(ctx, state.buildings);
   }
-  // 5. Vehicles (on top of roads)
-  if (Array.isArray(state.vehicles)) {
+  // 5. Vehicles (on top of roads) — now respect per-vehicle color when present  if (Array.isArray(state.vehicles)) {
     drawVehicles(ctx, state.vehicles);
   }
   // 6. UI overlays (score, fps, game over)
