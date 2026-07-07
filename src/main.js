@@ -1,8 +1,8 @@
 /**
  * src/main.js
  * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Now also owns dynamic playable-area growth and Mini Motorways-style color-district introduction (1 dest + 2 houses per new color).
- * Expected scale: ~270 LOC (growth from playable rect state + 3 local helpers + color-introduction logic + density expansion + input guards + road-avoidance plumbing for color districts; original structure and all non-spawn comments preserved).
- * Imports: ./config.js (FIXED_TIMESTEP, MAX_FRAME_SKIP, VEHICLE_SPAWN_INTERVAL, BUILDING_SPAWN_INTERVAL, GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, SHOW_FPS_COUNTER, BUILDING_COLORS), ./state.js (createInitialState, saveGameState, loadGameState), ./roads.js (createRoad, removeRoad, findRoadBetween, invalidateEdgeMap), ./buildings.js (createBuilding, findBuildingAtTile, updateBuildingTimers, getHousesWithDemand, getDestinations, getDestinationsByColor, spawnHouse, spawnDestination, hasOverloadedBuilding, decrementWaitingCount, incrementWaitingCount), ./vehicles.js (spawnVehicle, updateVehicles), ./render.js (render), ./input.js (initInput)
+ * Expected scale: ~271 LOC (growth from playable rect state + 3 local helpers + color-introduction logic + density expansion + input guards + road-avoidance plumbing for color districts; +1 LOC net for spawn fix: direct createBuilding to enforce playable bounds + unlocked colors; removed unused spawnHouse/spawnDestination imports).
+ * Imports: ./config.js (FIXED_TIMESTEP, MAX_FRAME_SKIP, VEHICLE_SPAWN_INTERVAL, BUILDING_SPAWN_INTERVAL, GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, SHOW_FPS_COUNTER, BUILDING_COLORS), ./state.js (createInitialState, saveGameState, loadGameState), ./roads.js (createRoad, removeRoad, findRoadBetween, invalidateEdgeMap), ./buildings.js (createBuilding, findBuildingAtTile, updateBuildingTimers, getHousesWithDemand, getDestinations, getDestinationsByColor, hasOverloadedBuilding, decrementWaitingCount, incrementWaitingCount), ./vehicles.js (spawnVehicle, updateVehicles), ./render.js (render), ./input.js (initInput)
  * Exports: None (executes setup on module evaluation / DOM ready)
  *
  * -- Defold equivalent: bootstrap `main.script` + `update(self, dt)` with `msg.post` for input; `init` for load/start.
@@ -44,8 +44,6 @@ import {
   getHousesWithDemand,
   getDestinations,
   getDestinationsByColor,
-  spawnHouse,
-  spawnDestination,
   hasOverloadedBuilding,
   decrementWaitingCount,
   incrementWaitingCount
@@ -339,11 +337,12 @@ function updateSimulation(dt) {
         const chosenColor = colorList[Math.floor(Math.random() * colorList.length)];
         const tile = findRandomEmptyInPlayable(state.buildings, state.roads);
         if (tile) {
-          if (Math.random() < 0.65) {
-            spawnHouse(state.buildings, state.roads);
-          } else {
-            spawnDestination(state.buildings, state.roads);
-          }
+          const spawnType = (Math.random() < 0.65) ? 'house' : 'destination';
+          // Use createBuilding directly with the pre-validated playable tile + chosenColor.
+          // spawnHouse/spawnDestination delegate to findRandomEmptyTile which samples the
+          // *full* 48×48 grid and would ignore playable bounds + could pick un-introduced colors.
+          // This also keeps normal spawns consistent with performColorIntroduction's approach.
+          createBuilding(state.buildings, spawnType, tile, chosenColor);
         }
       }
     } else {
