@@ -11,6 +11,36 @@
  *          BUILDING_COLORS, COLOR_HEX
  */
 
+// Starting state & colors
+export const INITIAL_COLORS = 1;
+export const STARTING_BUILDINGS = [
+  { type: 'house', color: 0 },
+  { type: 'dest', color: 0 }
+];
+
+// Footprints for grid.js valid-area checks (observed from source: dests need ~6 tiles)
+export const DEST_FOOTPRINT = { w: 3, h: 2 };
+export const HOUSE_FOOTPRINT = { w: 2, h: 1 };
+
+// Demand & pin generation (pins per second before multiplier)
+export const BASE_PIN_RATE = 0.5;
+export const OVERLOAD_PIN_THRESHOLD_SQUARE = 7;
+export const OVERLOAD_PIN_THRESHOLD_CIRCLE = 10;
+export const OVERLOAD_TIMER_MAX = 12; // ticks or seconds equivalent in main loop
+
+// Spawn control (used by buildings.js trySpawn)
+export const SPAWN_ATTEMPT_COOLDOWN_TICKS = 120; // ~2 seconds at 60 fps
+export const SPAWN_PROBE_ATTEMPTS = 30;          // performance budget for random probes
+export const MAX_BUILDINGS_EARLY = 4;            // soft cap that grows via milestones
+
+// Trip-score driven scaling (replaces week mechanic entirely)
+export const SCALING_MILESTONES = [20, 80, 200, 450, 900, 1600];
+export const DEMAND_RAMP_ON_SPAWN_FAIL = 0.15;   // multiplier boost when no space for new dest
+export const DEMAND_MULTIPLIER_STEP = 1.12;      // applied on each crossed milestone
+
+// Future-proof (color & cap growth)
+export const MAX_COLORS = 6;
+export const MAX_BUILDINGS_LATE = 18;
 export const GRID_WIDTH = 48;
 export const GRID_HEIGHT = 48;
 export const TILE_SIZE = 32;
