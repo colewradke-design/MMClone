@@ -1,6 +1,6 @@
 /**
  * src/render.js
- * Purpose: Canvas2D rendering of game state (grid, roads with congestion coloring, buildings with overload state, vehicles positioned via progress interpolation with simple car shape now using per-vehicle `color` (darkened house color) with fallback to COLORS.vehicle, score/FPS/game-over UI). Only module allowed to call Canvas APIs. Reads state + query helpers; no mutations or game logic.
+ * Purpose: Canvas2D rendering of game state (grid, roads with congestion coloring, buildings with overload state; waitingCount demand numbers shown only on destinations with distinct styling — house numbers removed, vehicles positioned via progress interpolation with simple car shape now using per-vehicle `color` (darkened house color) with fallback to COLORS.vehicle, score/FPS/game-over UI). Only module allowed to call Canvas APIs. Reads state + query helpers; no mutations or game logic.
  * Expected scale: ~138 LOC (+3 LOC for color fallback in drawVehicle). O(R+B+V) per frame explicitly flagged.
  * Imports: ./config.js (COLORS, TILE_SIZE, GRID_WIDTH, GRID_HEIGHT, SHOW_FPS_COUNTER, COLOR_HEX), ./roads.js (getSpeedFactor)
  * Exports: render
@@ -117,19 +117,24 @@ function drawBuilding(ctx, building) {
     ctx.arc(center.x, center.y, 11, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
-    if (building.waitingCount > 0) {
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 11px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(String(building.waitingCount), center.x, center.y + 1);
-    }
+    // House numbers removed per request: demand is now shown only on destinations
+    // (round-trip model puts waitingCount on destination buildings).
   } else {
     // destination
     ctx.fillStyle = fillColor;
     const s = 18;
     ctx.fillRect(center.x - s/2, center.y - s/2, s, s);
     ctx.strokeRect(center.x - s/2, center.y - s/2, s, s);
+
+    // Demand number display for destinations (round-trip model).
+    // Distinct yellow/smaller/offset styling so it is clearly different from any legacy house numbers.
+    if (building.waitingCount > 0) {
+      ctx.fillStyle = '#ffcc00'; // distinct gold/yellow for dest demand
+      ctx.font = 'bold 9px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(building.waitingCount), center.x, center.y + 2);
+    }
   }
 }
 /**
