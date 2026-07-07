@@ -1,8 +1,8 @@
 /**
  * src/main.js
- * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Now also owns dynamic playable-area growth and Mini Motorways-style color-district introduction (1 dest + 2 houses per new color).
- * Expected scale: ~271 LOC (growth from playable rect state + 3 local helpers + color-introduction logic + density expansion + input guards + road-avoidance plumbing for color districts; +1 LOC net for spawn fix: direct createBuilding to enforce playable bounds + unlocked colors; removed unused spawnHouse/spawnDestination imports).
- * Imports: ./config.js (FIXED_TIMESTEP, MAX_FRAME_SKIP, VEHICLE_SPAWN_INTERVAL, BUILDING_SPAWN_INTERVAL, GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, SHOW_FPS_COUNTER, BUILDING_COLORS), ./state.js (createInitialState, saveGameState, loadGameState), ./roads.js (createRoad, removeRoad, findRoadBetween, invalidateEdgeMap), ./buildings.js (createBuilding, findBuildingAtTile, updateBuildingTimers, getHousesWithDemand, getDestinations, getDestinationsByColor, hasOverloadedBuilding, decrementWaitingCount, incrementWaitingCount), ./vehicles.js (spawnVehicle, updateVehicles), ./render.js (render), ./input.js (initInput)
+ * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Now also owns dynamic playable-area growth and Mini Motorways-style color-district introduction (1 dest + 2 houses per new color). Vehicle spawn logic updated for round-trip model: destinations hold demand; houses send vehicles to retrieve from matching-color destinations that have unmet demand; delivery credited only on return to house (handled inside vehicles.js).
+ * Expected scale: ~285 LOC (growth from round-trip spawn model + demand-regen retargeting to destinations + initial-demand seeding in color intro + minor comment updates).
+ * Imports: ./config.js (FIXED_TIMESTEP, MAX_FRAME_SKIP, VEHICLE_SPAWN_INTERVAL, BUILDING_SPAWN_INTERVAL, GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, SHOW_FPS_COUNTER, BUILDING_COLORS), ./state.js (createInitialState, saveGameState, loadGameState), ./roads.js (createRoad, removeRoad, findRoadBetween, invalidateEdgeMap), ./buildings.js (createBuilding, findBuildingAtTile, updateBuildingTimers, getDestinations, getDestinationsByColor, hasOverloadedBuilding, decrementWaitingCount, incrementWaitingCount), ./vehicles.js (spawnVehicle, updateVehicles), ./render.js (render), ./input.js (initInput)
  * Exports: None (executes setup on module evaluation / DOM ready)
  *
  * -- Defold equivalent: bootstrap `main.script` + `update(self, dt)` with `msg.post` for input; `init` for load/start.
@@ -41,7 +41,6 @@ import {
   createBuilding,
   findBuildingAtTile,
   updateBuildingTimers,
-  getHousesWithDemand,
   getDestinations,
   getDestinationsByColor,
   hasOverloadedBuilding,
@@ -174,6 +173,7 @@ function findRandomEmptyInPlayable(buildings, roads = []) {
  * picks an unused color, places exactly one destination of that color, then places exactly two houses of the same color
  * (biased toward clustering near the new destination, falling back to any empty playable tile that has no building and no road endpoint).
  * Adds the color to unlockedColors on success. Returns true only if the destination was successfully created.
+ * Also seeds a small initial demand on the new destination so vehicles begin flowing immediately under the round-trip model.
  * @param {Building[]} buildings
  * @param {Road[]} [roads=[]]
  * @returns {boolean}
@@ -191,6 +191,9 @@ function performColorIntroduction(buildings, roads = []) {
   if (!dest) return false;
 
   unlockedColors.add(newColor);
+
+  // Seed initial demand on the new destination (round-trip model: destinations hold demand)
+  incrementWaitingCount(buildings, dest.id, 1);
 
   // Try to cluster the two houses near the new destination (small radius first)
   let housesPlaced = 0;
@@ -216,7 +219,7 @@ function performColorIntroduction(buildings, roads = []) {
     else break;
   }
 
-  console.log(`[main] New color district introduced: ${newColor} (1 destination + ${housesPlaced} houses)`);
+  console.log(`[main] New color district introduced: ${newColor} (1 destination + ${housesPlaced} houses, initial dest demand seeded)`);
   return true;
 }
 
@@ -264,7 +267,7 @@ function checkDensityAndExpandIfNeeded(buildings, roads) {
 
 /**
  * Performs one fixed-timestep simulation step.
- * Order: timers → loss check → vehicles (deliveries) → spawns → periodic save.
+ * Order: timers → loss check → vehicles (deliveries on return) → spawns (now destination-demand driven) → periodic save.
  * Freezes further simulation once gameOver is set (next tick returns early).
  * Density/expansion check runs at end of every tick while playing.
  * @param {number} dt - fixed timestep in seconds
@@ -276,7 +279,7 @@ function updateSimulation(dt) {
 
   state.tick++;
 
-  // Building wait timers (may set overloaded flags)
+  // Building wait timers (may set overloaded flags on destinations or legacy houses)
   updateBuildingTimers(state.buildings, dt);
 
   // Loss condition: any overloaded building ends the session immediately
@@ -286,41 +289,54 @@ function updateSimulation(dt) {
     // Finish this tick (vehicles may still deliver) then freeze on subsequent ticks
   }
 
-  // Vehicles: movement, queueing, adaptive reroutes, arrivals → deliveries
+  // Vehicles: movement, queueing, adaptive reroutes, arrivals (pickup at dest + return to house for credit)
   const deliveries = updateVehicles(state.vehicles, state.roads, state.buildings, dt);
   state.score += deliveries;
 
-  // Vehicle spawning from houses with demand
+  // Vehicle spawning — now destination-demand driven for round-trip model
+  // Houses of a matching color send vehicles to retrieve from destinations that have unmet demand.
+  // No decrement on spawn (decrement happens inside vehicles.js on arrival at destination).
   vehicleSpawnTimer += dt;
   if (vehicleSpawnTimer >= VEHICLE_SPAWN_INTERVAL) {
     vehicleSpawnTimer -= VEHICLE_SPAWN_INTERVAL;
-    const houses = getHousesWithDemand(state.buildings);
-    if (houses.length > 0) {
-      const house = houses[Math.floor(Math.random() * houses.length)];
-      // Color-matching spawn rule (color identity system):
-      // Houses only send vehicles to destinations whose color exactly matches the house color.
-      // We replace the previous global getDestinations() with the color-filtered query.
-      // If the randomly chosen house has zero matching-color destinations, we skip spawning
-      // this tick entirely (the house retains its waitingCount/demand).
-      const dests = getDestinationsByColor(state.buildings, house.color);
-      if (dests.length > 0) {
-        let dest = dests[Math.floor(Math.random() * dests.length)];
-        // avoid self if somehow same id (not possible by type)
-        if (house.id === dest.id && dests.length > 1) {
-          dest = dests[(Math.floor(Math.random() * dests.length) + 1) % dests.length];
-        }
+
+    // Find destinations that currently have unmet demand (of unlocked colors)
+    const destsWithDemand = state.buildings.filter(b =>
+      b.type === 'destination' &&
+      b.waitingCount > 0 &&
+      !b.overloaded &&
+      unlockedColors.has(b.color)
+    );
+
+    if (destsWithDemand.length > 0) {
+      const dest = destsWithDemand[Math.floor(Math.random() * destsWithDemand.length)];
+
+      // Find houses of the exact same color (these are the "senders" that retrieve)
+      const housesOfColor = state.buildings.filter(b =>
+        b.type === 'house' &&
+        b.color === dest.color &&
+        !b.overloaded
+      );
+
+      if (housesOfColor.length > 0) {
+        const house = housesOfColor[Math.floor(Math.random() * housesOfColor.length)];
+
+        // Spawn round-trip vehicle: house → dest (vehicles.js will decrement dest demand on arrival
+        // and automatically return to house for delivery credit)
         if (house.id !== dest.id) {
           const vehicle = spawnVehicle(state.vehicles, house.id, dest.id, state.roads, state.buildings);
+          // Note: no decrementWaitingCount on house or dest here — vehicles.js owns the retrieve decrement
           if (vehicle) {
-            decrementWaitingCount(state.buildings, house.id);
+            // successful spawn; demand will be decremented on arrival at dest
           }
         }
       }
-      // else: no matching-color destination for this house — skip spawn, demand retained
     }
+    // If no dests have demand yet, or no matching houses, simply skip this spawn tick.
+    // Demand regen below will create more demand on destinations over time.
   }
 
-  // Building spawning — now uses controlled color-district introduction + unlocked-color normal spawns
+  // Building spawning — controlled color-district introduction + unlocked-color normal spawns (unchanged)
   buildingSpawnTimer += dt;
   if (buildingSpawnTimer >= BUILDING_SPAWN_INTERVAL) {
     buildingSpawnTimer -= BUILDING_SPAWN_INTERVAL;
@@ -338,10 +354,6 @@ function updateSimulation(dt) {
         const tile = findRandomEmptyInPlayable(state.buildings, state.roads);
         if (tile) {
           const spawnType = (Math.random() < 0.65) ? 'house' : 'destination';
-          // Use createBuilding directly with the pre-validated playable tile + chosenColor.
-          // spawnHouse/spawnDestination delegate to findRandomEmptyTile which samples the
-          // *full* 48×48 grid and would ignore playable bounds + could pick un-introduced colors.
-          // This also keeps normal spawns consistent with performColorIntroduction's approach.
           createBuilding(state.buildings, spawnType, tile, chosenColor);
         }
       }
@@ -352,23 +364,23 @@ function updateSimulation(dt) {
   }
 
   // Demand regeneration: periodically refill waitingCount on a random subset of
-  // non-overloaded houses that have cleared prior demand (waitingCount === 0).
-  // This sustains ongoing traffic/congestion instead of one-shot deliveries per house.
-  // Only when destinations exist (cheap proxy for "houses with connected destinations").
-  // Small subset (≤2) keeps volume manageable. Uses only already-exported buildings.js APIs.
+  // non-overloaded destinations (primary) that have cleared prior demand (waitingCount === 0).
+  // This sustains ongoing retrieve traffic under the round-trip model.
+  // Uses unlockedColors as a cheap proxy for "districts that are active".
+  // Small subset (≤2) keeps volume manageable.
   houseDemandRegenTimer += dt;
   if (houseDemandRegenTimer >= HOUSE_DEMAND_REGEN_INTERVAL) {
     houseDemandRegenTimer -= HOUSE_DEMAND_REGEN_INTERVAL;
-    if (getDestinations(state.buildings).length > 0) {
-      const candidates = state.buildings.filter(b =>
-        b.type === 'house' && !b.overloaded && b.waitingCount === 0
-      );
-      if (candidates.length > 0) {
-        const num = Math.min(2, candidates.length);
-        for (let k = 0; k < num; k++) {
-          const h = candidates[Math.floor(Math.random() * candidates.length)];
-          incrementWaitingCount(state.buildings, h.id, 1);
-        }
+
+    const activeDests = getDestinations(state.buildings).filter(d =>
+      !d.overloaded && unlockedColors.has(d.color) && d.waitingCount === 0
+    );
+
+    if (activeDests.length > 0) {
+      const num = Math.min(2, activeDests.length);
+      for (let k = 0; k < num; k++) {
+        const d = activeDests[Math.floor(Math.random() * activeDests.length)];
+        incrementWaitingCount(state.buildings, d.id, 1);
       }
     }
   }
@@ -429,7 +441,8 @@ function gameLoop(now = performance.now()) {
  * Restarts the game to a fresh session.
  * Discards previous state entirely (new arrays, reset timers, initial buildings).
  * Calls invalidateEdgeMap because roads reference is replaced.
- * Resets playable area to initial 10×10 and performs 1–2 color-introduction events.
+ * Resets playable area to initial 10×10 and performs 1–2 color-introduction events
+ * (each new destination is seeded with initial demand).
  */
 function restartGame() {
   if (!state) return;
@@ -440,6 +453,7 @@ function restartGame() {
   resetPlayableArea();
 
   // Seed a playable starting position using color-district introduction (1 dest + 2 houses per color)
+  // performColorIntroduction now also seeds demand on the new destination
   performColorIntroduction(state.buildings, state.roads);
   if (Math.random() < 0.6) {
     performColorIntroduction(state.buildings, state.roads);
@@ -509,6 +523,7 @@ async function initGame() {
     resetPlayableArea();
 
     // Seed initial playable district(s) — one or two color-introduction events inside the small starting 10×10 area
+    // (each new destination receives initial demand via performColorIntroduction)
     performColorIntroduction(state.buildings, state.roads);
     if (Math.random() < 0.6) {
       performColorIntroduction(state.buildings, state.roads);
