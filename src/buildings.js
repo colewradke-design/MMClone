@@ -134,8 +134,9 @@ function findRandomEmptyTile(buildings, roads = []) {
 
 /**
  * Creates and appends a new Building if tile is valid, in-bounds, unoccupied, and under MAX_BUILDINGS.
- * Houses start with waitingCount=1 (immediate demand); destinations start at 0.
- * Color is assigned here: if a valid color string is passed as 4th arg, use it; otherwise pick balanced random from the 5 canonical colors.
+ * All buildings (house + destination) now start with waitingCount=0 under the round-trip model.
+ * Demand is seeded and incremented exclusively on destinations via main.js + incrementWaitingCount;
+ * houses no longer represent demand sources. Color assignment unchanged.
  * Old buildings without color field (from pre-color createInitialState) are not created here anymore — creation always emits color.
  * Note: createBuilding itself only enforces no-building-at-tile (plus bounds/max). The optional "no road connection" filter
  * is applied upstream in findRandomEmptyTile / spawnHouse / spawnDestination when a roads array is passed.
@@ -169,7 +170,7 @@ export function createBuilding(buildings, type, tile, color) {
     id: generateBuildingId(),
     type,
     tile: { x: tile.x, y: tile.y },
-    waitingCount: (type === 'house' ? 1 : 0),
+    waitingCount: 0,
     waitTimer: 0,
     overloaded: false,
     color: assignedColor
@@ -354,7 +355,7 @@ export function getDestinationsByColor(buildings, color) {
 
 /**
  * Spawn helper: attempts to place a new house at a random empty tile (optionally avoiding road-connected tiles).
- * Uses createBuilding internally (initial waitingCount=1, color auto-assigned).
+ * Uses createBuilding internally (initial waitingCount=0, color auto-assigned).
  * If roads param is provided and non-empty, only tiles with no building AND no road endpoint are considered.
  * When roads is omitted (or empty), behaves exactly as before — permissive spawning on any empty tile.
  * @param {Building[]} buildings
