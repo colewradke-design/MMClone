@@ -170,6 +170,7 @@ export function spawnVehicle(vehicles, originId, destinationId, roads, buildings
 
   const personality = Math.random();
   const path = findPath(roads, originTile, destTile, personality);
+  vehicle.color = originB.color;
   if (!path || path.length < 2) {
     return null; // unreachable — do not activate
   }
