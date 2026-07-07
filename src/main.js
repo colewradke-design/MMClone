@@ -1,7 +1,7 @@
 /**
  * src/main.js
- * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Now also owns dynamic playable-area growth and Mini Motorways-style color-district introduction (1 dest + 2 houses per new color). Vehicle spawn logic updated for round-trip model: destinations hold demand; houses send vehicles to retrieve from matching-color destinations that have unmet demand; delivery credited only on return to house (handled inside vehicles.js).
- * Expected scale: ~285 LOC (growth from round-trip spawn model + demand-regen retargeting to destinations + initial-demand seeding in color intro + minor comment updates).
+ * Purpose: Fixed-timestep game loop orchestration, FPS measurement, input handler wiring, session lifecycle (init/load/restart), persistence integration, and loss-condition evaluation. Owns high-level flow and the few open decisions (loss timing, save triggers). All other modules are called; main performs no pathfinding, movement, road/building mutation rules, or rendering itself. Now also owns dynamic playable-area growth and Mini Motorways-style color-district introduction (1 dest + 2 houses per new color). Vehicle spawn logic updated for round-trip model. ADDED: onRoadToggle now enforces "one driveway per house" (at most one road edge incident to any house tile) to match source material — checked via existing findBuildingAtTile + tileHasAnyRoadConnection before any createRoad.
+ * Expected scale: ~290 LOC (+~5 LOC for driveway rule guard + header/doc updates).
  * Imports: ./config.js (FIXED_TIMESTEP, MAX_FRAME_SKIP, VEHICLE_SPAWN_INTERVAL, BUILDING_SPAWN_INTERVAL, GRID_WIDTH, GRID_HEIGHT, TILE_SIZE, SHOW_FPS_COUNTER, BUILDING_COLORS), ./state.js (createInitialState, saveGameState, loadGameState), ./roads.js (createRoad, removeRoad, findRoadBetween, invalidateEdgeMap), ./buildings.js (createBuilding, findBuildingAtTile, updateBuildingTimers, getDestinations, getDestinationsByColor, hasOverloadedBuilding, decrementWaitingCount, incrementWaitingCount), ./vehicles.js (spawnVehicle, updateVehicles), ./render.js (render), ./input.js (initInput)
  * Exports: None (executes setup on module evaluation / DOM ready)
  *
@@ -568,6 +568,19 @@ async function initGame() {
       if (!isInPlayable(from) || !isInPlayable(to)) return; // confine road drawing to playable area
       roadEditThisGesture = true; // any invocation means this was a drag gesture (not a pure tap)
       if (!state || state.gameOver) return;
+
+      // Enforce "one driveway per house" rule to mimic Mini Motorways.
+      // A house tile may be incident to at most one road edge. Checked on every
+      // attempted new connection (both endpoints). Uses already-present helpers
+      // (findBuildingAtTile + tileHasAnyRoadConnection) — zero new imports or
+      // contract changes to other modules.
+      const fromB = findBuildingAtTile(state.buildings, from);
+      const toB = findBuildingAtTile(state.buildings, to);
+      if ((fromB && fromB.type === 'house' && tileHasAnyRoadConnection(state.roads, from)) ||
+          (toB && toB.type === 'house' && tileHasAnyRoadConnection(state.roads, to))) {
+        return; // block second driveway on any house
+      }
+
       if (!findRoadBetween(state.roads, from, to)) {
         createRoad(state.roads, from, to);
       }
