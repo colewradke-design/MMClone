@@ -1,8 +1,8 @@
 /**
  * src/vehicles.js
- * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard to eliminate visual jitter from forced progress=0 reset), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking. Vehicles now carry an optional `color` (darkened hex from origin house) set once at spawn for future visual identity in render. No gameplay, pathing, or movement changes.
- * Expected scale: ~255 LOC (+~13 LOC for private darken helper + color assignment/reset logic). Zero per-frame allocations or cost added.
- * Imports: ./config.js (MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS), ./grid.js (getTileDistance), ./roads.js (addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge), ./buildings.js (findBuildingById), ./pathfinding.js (findPath)
+ * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard to eliminate visual jitter from forced progress=0 reset), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking. Vehicles now carry an optional `color` (darkened hex resolved from origin house's named color via COLOR_HEX, then darkened). Fixed spawn color bug (was receiving 'red' etc. instead of hex → grey fallback). No gameplay, pathing, or movement changes.
+ * Expected scale: ~260 LOC (+~5 LOC for robust name→hex lookup + NaN guards in darkenHexColor + import). Zero per-frame allocations or cost added.
+ * Imports: ./config.js (MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS, COLOR_HEX), ./grid.js (getTileDistance), ./roads.js (addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge), ./buildings.js (findBuildingById), ./pathfinding.js (findPath)
  * Exports: findVehicleById, spawnVehicle, deactivateVehicle, updateVehicles
  *
  * -- Defold equivalent: bootstrap + per-vehicle or manager update(dt) with msg routing for occupancy handoff.
@@ -10,7 +10,7 @@
 // -----------------------------------------------------------------------------
 // Imports & module state
 // -----------------------------------------------------------------------------
-import { MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS } from './config.js';
+import { MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS, COLOR_HEX } from './config.js';
 import { getTileDistance } from './grid.js';
 import { addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge } from './roads.js';
 import { findBuildingById } from './buildings.js';
@@ -71,17 +71,28 @@ function getNormalizedEdgeKey(from, to) {
 }
 
 /**
- * Returns a slightly darker version of the given hex color.
- * Simple RGB-based darkening suitable for prototype use. Keeps output as 6-digit #hex.
- * Used to give vehicles a distinct but related shade of their spawning house color.
- * @param {string} hex
+ * Returns a slightly darker version of the given color.
+ * Accepts either a named color key from BUILDING_COLORS (e.g. 'red') — resolved via COLOR_HEX —
+ * or a direct #hex string. Simple RGB-based darkening suitable for prototype use.
+ * Keeps output as 6-digit #hex. Used to give vehicles a distinct but related shade of their
+ * spawning house color so they are visually identifiable by origin district.
+ * @param {string} input
  * @param {number} [factor=0.78]
  * @returns {string}
  */
-function darkenHexColor(hex, factor = 0.78) {
-  if (!hex || typeof hex !== 'string') {
+function darkenHexColor(input, factor = 0.78) {
+  if (!input || typeof input !== 'string') {
     return COLORS.vehicle || '#2d2d2d';
   }
+
+  let hex = input;
+  if (COLOR_HEX && COLOR_HEX[input]) {
+    hex = COLOR_HEX[input];
+  } else if (!input.startsWith('#')) {
+    // Unknown color name (not in COLOR_HEX) — fall back rather than produce garbage
+    return COLORS.vehicle || '#2d2d2d';
+  }
+
   let c = hex.startsWith('#') ? hex.slice(1) : hex;
   if (c.length === 3) {
     c = c.split('').map(ch => ch + ch).join('');
@@ -89,9 +100,17 @@ function darkenHexColor(hex, factor = 0.78) {
   if (c.length !== 6) {
     return COLORS.vehicle || '#2d2d2d';
   }
-  const r = Math.max(0, Math.floor(parseInt(c.slice(0, 2), 16) * factor));
-  const g = Math.max(0, Math.floor(parseInt(c.slice(2, 4), 16) * factor));
-  const b = Math.max(0, Math.floor(parseInt(c.slice(4, 6), 16) * factor));
+
+  const rRaw = parseInt(c.slice(0, 2), 16);
+  const gRaw = parseInt(c.slice(2, 4), 16);
+  const bRaw = parseInt(c.slice(4, 6), 16);
+  if (isNaN(rRaw) || isNaN(gRaw) || isNaN(bRaw)) {
+    return COLORS.vehicle || '#2d2d2d';
+  }
+
+  const r = Math.max(0, Math.floor(rRaw * factor));
+  const g = Math.max(0, Math.floor(gRaw * factor));
+  const b = Math.max(0, Math.floor(bRaw * factor));
   return '#' + r.toString(16).padStart(2, '0') +
          g.toString(16).padStart(2, '0') +
          b.toString(16).padStart(2, '0');
@@ -122,11 +141,11 @@ export function findVehicleById(vehicles, id) {
  * Computes initial path via findPath; fails (returns null) if no route exists.
  * Adds vehicle to first edge's occupantIds. Caller must decrement house waitingCount.
  * Staggers initial rerouteTimer with random offset.
- * Color behavior: After locating the origin house, reads its `color` field and stores a
- * slightly darkened version (via darkenHexColor) on the vehicle instance. This enables
- * visual identity (which house a car came from) while maintaining contrast on dark roads.
- * Legacy houses without a color field fall back to COLORS.vehicle. The field is always
- * (re)set on every spawn/reuse from the pool.
+ * Color behavior: After locating the origin house, reads its `color` field (a BUILDING_COLORS name),
+ * resolves it to hex via COLOR_HEX, then stores a slightly darkened version (via darkenHexColor)
+ * on the vehicle instance. This enables visual identity (which house/district a car came from)
+ * while maintaining contrast on dark roads. Legacy houses without a color field fall back to
+ * COLORS.vehicle. The field is always (re)set on every spawn/reuse from the pool.
  * @param {Vehicle[]} vehicles
  * @param {string} originId
  * @param {string} destinationId
@@ -170,7 +189,6 @@ export function spawnVehicle(vehicles, originId, destinationId, roads, buildings
 
   const personality = Math.random();
   const path = findPath(roads, originTile, destTile, personality);
-  vehicle.color = originB.color;
   if (!path || path.length < 2) {
     return null; // unreachable — do not activate
   }
