@@ -2,7 +2,7 @@
  * src/render.js
  * Purpose: Canvas2D rendering of game state (grid, roads with congestion coloring, buildings with overload state, vehicles positioned via progress interpolation with simple car shape now using per-vehicle `color` (darkened house color) with fallback to COLORS.vehicle, score/FPS/game-over UI). Only module allowed to call Canvas APIs. Reads state + query helpers; no mutations or game logic.
  * Expected scale: ~138 LOC (+3 LOC for color fallback in drawVehicle). O(R+B+V) per frame explicitly flagged.
- * Imports: ./config.js (COLORS, TILE_SIZE, GRID_WIDTH, GRID_HEIGHT, SHOW_FPS_COUNTER), ./roads.js (getSpeedFactor)
+ * Imports: ./config.js (COLORS, TILE_SIZE, GRID_WIDTH, GRID_HEIGHT, SHOW_FPS_COUNTER, COLOR_HEX), ./roads.js (getSpeedFactor)
  * Exports: render
  *
  * Per-frame complexity: O(R + B + V) — single pass over roads (~<400), buildings (<150), active vehicles (<300). All operations constant time per entity. ZERO hidden allocations in the render loop (module-scoped scratch objects + inlined interpolation replace all tileToPixelCenter calls and position returns). Acceptable well under 16ms budget even at 60fps.
@@ -16,7 +16,8 @@ import { getSpeedFactor } from './roads.js';
 /** @typedef {{x: number, y: number}} TileCoord */
 /** @typedef {{id: string, from: TileCoord, to: TileCoord, capacity: number, occupantIds: string[]}} Road */
 /** @typedef {{id: string, type: 'house'|'destination', tile: TileCoord, waitingCount: number, waitTimer: number, overloaded: boolean, color?: 'red'|'blue'|'green'|'yellow'|'purple'}} Building */
-/** @typedef {{id: string, active: boolean, originId: string|null, destinationId: string|null, path: TileCoord[], pathIndex: number, progress: number, speed: number, personality: number, rerouteTimer: number, color?: string}} Vehicle */// -----------------------------------------------------------------------------
+/** @typedef {{id: string, active: boolean, originId: string|null, destinationId: string|null, path: TileCoord[], pathIndex: number, progress: number, speed: number, personality: number, rerouteTimer: number, color?: string}} Vehicle */
+// -----------------------------------------------------------------------------
 // Allocation-free scratch objects (RULES.md §11 compliance)
 // Reused across all draw calls. Safe because usage is synchronous and immediate
 // (compute → draw with values → next iteration overwrites).
@@ -41,8 +42,8 @@ function writeTileCenter(tile, out) {
 // -----------------------------------------------------------------------------
 /**
  * Draws faint grid lines for tile boundaries.
- * Vehicle body now uses vehicle.color (darkened house color) when present, with fallback to COLORS.vehicle. */
-
+ * @param {CanvasRenderingContext2D} ctx
+ */
 function drawGridLines(ctx) {
   const gridPixelWidth = GRID_WIDTH * TILE_SIZE;
   const gridPixelHeight = GRID_HEIGHT * TILE_SIZE;
@@ -145,6 +146,7 @@ function drawBuildings(ctx, buildings) {
  * Draws a vehicle as a simple oriented car shape (rect) when on an edge; circle if at final tile.
  * All pixel math uses scratch objects + inlined interpolation. Zero allocations.
  * Computes p1/p2 once and reuses for both position lerp and angle (addresses double-call concern).
+ * Vehicle body now uses vehicle.color (darkened house color) when present, with fallback to COLORS.vehicle.
  * @param {CanvasRenderingContext2D} ctx
  * @param {Vehicle} vehicle
  */
@@ -153,7 +155,8 @@ function drawVehicle(ctx, vehicle) {
   if (vehicle.pathIndex >= vehicle.path.length - 1) {
     // arrived / final tile — simple dot (reuse scratch)
     writeTileCenter(vehicle.path[vehicle.path.length - 1], _p1);
-    ctx.fillStyle = vehicle.color || COLORS.vehicle;    ctx.beginPath();
+    ctx.fillStyle = vehicle.color || COLORS.vehicle;
+    ctx.beginPath();
     ctx.arc(_p1.x, _p1.y, 5, 0, Math.PI * 2);
     ctx.fill();
     return;
@@ -170,8 +173,9 @@ function drawVehicle(ctx, vehicle) {
   ctx.translate(posX, posY);
   const angle = Math.atan2(_p2.y - _p1.y, _p2.x - _p1.x);
   ctx.rotate(angle);
-// Car body (now uses per-vehicle color when available)
-  ctx.fillStyle = vehicle.color || COLORS.vehicle;  ctx.fillRect(-7, -3.5, 14, 7);
+  // Car body (now uses per-vehicle color when available)
+  ctx.fillStyle = vehicle.color || COLORS.vehicle;
+  ctx.fillRect(-7, -3.5, 14, 7);
   // Front windshield accent
   ctx.fillStyle = '#4a4a4a';
   ctx.fillRect(1, -2.5, 5, 5);
@@ -253,7 +257,8 @@ export function render(ctx, state, fps = 0) {
   if (Array.isArray(state.buildings)) {
     drawBuildings(ctx, state.buildings);
   }
-  // 5. Vehicles (on top of roads) — now respect per-vehicle color when present  if (Array.isArray(state.vehicles)) {
+  // 5. Vehicles (on top of roads) — now respect per-vehicle color when present
+  if (Array.isArray(state.vehicles)) {
     drawVehicles(ctx, state.vehicles);
   }
   // 6. UI overlays (score, fps, game over)
