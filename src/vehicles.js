@@ -1,11 +1,11 @@
 /**
  * src/vehicles.js
- * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard to eliminate visual jitter from forced progress=0 reset), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking. Vehicles now carry an optional `color` (darkened hex resolved from origin house's named color via COLOR_HEX, then darkened). Fixed spawn color bug (was receiving 'red' etc. instead of hex → grey fallback). No gameplay, pathing, or movement changes.
- * Expected scale: ~260 LOC (+~5 LOC for robust name→hex lookup + NaN guards in darkenHexColor + import). Zero per-frame allocations or cost added.
- * Imports: ./config.js (MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS, COLOR_HEX), ./grid.js (getTileDistance), ./roads.js (addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge), ./buildings.js (findBuildingById), ./pathfinding.js (findPath)
+ * Purpose: Object pool for vehicles, spawn/activation with pathfinding, per-timestep movement (congestion speed + same-direction queueing via progress clamp), staggered adaptive rerouting (personality-weighted, with mid-edge progress guard), edge occupancy lifecycle via roads.js API, arrival detection + recycling to pool. Now supports explicit Mini Motorways-style round-trip: outbound house→destination (decrement demand on arrival at dest), then automatic return path to originating house (delivery/score credited only on return arrival at house). Engine-agnostic; reads occupancy/speedFactor but does not duplicate tracking. Vehicles carry optional `color`.
+ * Expected scale: ~310 LOC (+~55 LOC for round-trip arrival handler, return path computation on pickup, import updates, JSDoc, and guards). Zero per-frame allocations added.
+ * Imports: ./config.js (MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS, COLOR_HEX), ./grid.js (getTileDistance), ./roads.js (addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge), ./buildings.js (findBuildingById, findBuildingAtTile, decrementWaitingCount), ./pathfinding.js (findPath)
  * Exports: findVehicleById, spawnVehicle, deactivateVehicle, updateVehicles
  *
- * -- Defold equivalent: bootstrap + per-vehicle or manager update(dt) with msg routing for occupancy handoff.
+ * -- Defold equivalent: bootstrap + per-vehicle or manager update(dt) with msg routing for occupancy handoff + round-trip state machine.
  */
 // -----------------------------------------------------------------------------
 // Imports & module state
@@ -13,7 +13,7 @@
 import { MAX_VEHICLES, VEHICLE_SPEED, REROUTE_CHECK_INTERVAL, VEHICLE_FOLLOW_DISTANCE, COLORS, COLOR_HEX } from './config.js';
 import { getTileDistance } from './grid.js';
 import { addVehicleToEdge, removeVehicleFromEdge, getSpeedFactorForEdge } from './roads.js';
-import { findBuildingById } from './buildings.js';
+import { findBuildingById, findBuildingAtTile, decrementWaitingCount } from './buildings.js';
 import { findPath } from './pathfinding.js';
 
 /** @typedef {{x: number, y: number}} TileCoord */
@@ -139,13 +139,11 @@ export function findVehicleById(vehicles, id) {
 /**
  * Spawns/activates a vehicle from pool (reuses inactive or appends if under MAX_VEHICLES).
  * Computes initial path via findPath; fails (returns null) if no route exists.
- * Adds vehicle to first edge's occupantIds. Caller must decrement house waitingCount.
+ * Adds vehicle to first edge's occupantIds. Caller must decrement house waitingCount (legacy) or manage dest demand.
  * Staggers initial rerouteTimer with random offset.
- * Color behavior: After locating the origin house, reads its `color` field (a BUILDING_COLORS name),
- * resolves it to hex via COLOR_HEX, then stores a slightly darkened version (via darkenHexColor)
- * on the vehicle instance. This enables visual identity (which house/district a car came from)
- * while maintaining contrast on dark roads. Legacy houses without a color field fall back to
- * COLORS.vehicle. The field is always (re)set on every spawn/reuse from the pool.
+ * Round-trip contract: vehicle travels house → destination (pickup), decrements demand at destination on arrival,
+ * then automatically paths back to the originating house. Delivery credit is given only on return arrival at house.
+ * Color behavior unchanged.
  * @param {Vehicle[]} vehicles
  * @param {string} originId
  * @param {string} destinationId
@@ -245,13 +243,75 @@ export function deactivateVehicle(vehicles, roads, id) {
 }
 
 /**
+ * Internal helper: handles arrival when a vehicle reaches the final tile of its current path.
+ * Implements explicit round-trip:
+ *   - If arrived at destination (outbound): decrement its waitingCount (retrieve), then compute + start
+ *     return path to originating house (repurposes destinationId to house for reroute/goal tracking).
+ *     No delivery credit yet.
+ *   - If arrived at house after return leg (destinationId now points to house): credit delivery + deactivate.
+ *   - Fallback / legacy one-way: credit + deactivate.
+ * Returns number of deliveries credited this call (0 or 1). Mutates vehicle in place.
+ * Called from both the "sitting at final" early-out and the edge-transition "reached final this frame" paths.
+ * @param {Vehicle} v
+ * @param {Vehicle[]} vehicles
+ * @param {Road[]} roads
+ * @param {Building[]} buildings
+ * @returns {number}
+ */
+function handleVehicleArrival(v, vehicles, roads, buildings) {
+  if (!v || !v.active || !v.path || v.path.length === 0) return 0;
+
+  const finalTile = v.path[v.path.length - 1];
+  const arrivedB = findBuildingAtTile(buildings, finalTile);
+  if (!arrivedB) {
+    deactivateVehicle(vehicles, roads, v.id);
+    return 1;
+  }
+
+  // Outbound pickup at destination
+  const isOutboundPickup = (arrivedB.type === 'destination' && arrivedB.id === v.destinationId);
+  if (isOutboundPickup) {
+    decrementWaitingCount(buildings, arrivedB.id, 1);
+
+    const houseB = v.originId ? findBuildingById(buildings, v.originId) : null;
+    if (houseB) {
+      const returnPath = findPath(roads, finalTile, houseB.tile, v.personality);
+      if (returnPath && returnPath.length >= 2) {
+        // Repurpose destinationId to house so reroute + future arrival checks treat house as the goal
+        v.destinationId = v.originId;
+        v.path = returnPath;
+        v.pathIndex = 0;
+        v.progress = 0;
+        addVehicleToEdge(roads, returnPath[0], returnPath[1], v.id);
+        return 0; // credit happens on return arrival at house
+      }
+    }
+    // Could not compute return path — fallback: credit at pickup location and recycle
+    deactivateVehicle(vehicles, roads, v.id);
+    return 1;
+  }
+
+  // Return leg arrival at originating house (we set destinationId = house id on pickup)
+  const isReturnToHouse = (arrivedB.type === 'house' && arrivedB.id === v.destinationId);
+  if (isReturnToHouse) {
+    deactivateVehicle(vehicles, roads, v.id);
+    return 1;
+  }
+
+  // Legacy one-way or unexpected arrival: credit + recycle
+  deactivateVehicle(vehicles, roads, v.id);
+  return 1;
+}
+
+/**
  * Fixed-timestep vehicle simulation (call from main.js once per FIXED_TIMESTEP).
  * - Staggered reroute checks (personality-weighted findPath from current position)
  * - Congestion speedFactor from roads.js
  * - Per-edge same-direction queueing: groups vehicles, clamps progress behind leader (VEHICLE_FOLLOW_DISTANCE)
- * - Edge transitions: remove from old edge, advance pathIndex, add to new edge, handle arrival
- * - On arrival: recycle to pool, return +1 delivery count for main.js to apply to score
- * Per-frame complexity: O(V) build groups + O(V) updates + O(V × R) from getSpeedFactorForEdge calls (R = roads.length via internal findRoadBetween linear scan). Reroutes amortized & staggered (now guarded on low progress to avoid mid-edge snaps; cost unchanged).
+ * - Edge transitions: remove from old edge, advance pathIndex, add to new edge, handle arrival (now supports round-trip)
+ * - On arrival at destination: retrieve (decrement), auto-path return to house
+ * - On arrival back at house: recycle to pool, return +1 delivery count for main.js to apply to score
+ * Per-frame complexity: O(V) build groups + O(V) updates + O(V × R) from getSpeedFactorForEdge calls (R = roads.length via internal findRoadBetween linear scan). Reroutes amortized & staggered (guarded on low progress). Round-trip adds one extra findPath + add/remove edge per delivery (amortized, infrequent).
  * -- Defold equivalent: update(dt) on a script/component attached to vehicle instances or a manager
  * @param {Vehicle[]} vehicles
  * @param {Road[]} roads
@@ -372,18 +432,9 @@ export function updateVehicles(vehicles, roads, buildings, dt) {
 
     // --- Movement (only if still has an edge to traverse) ---
     if (!v.path || v.path.length === 0 || v.pathIndex >= v.path.length - 1) {
-      // Check for arrival at destination tile
+      // Check for arrival at final tile of current leg (handles both outbound pickup and return-to-house)
       if (v.pathIndex >= v.path.length - 1 && v.progress >= 0.999) {
-        deliveredCount++;
-        v.active = false;
-        v.originId = null;
-        v.destinationId = null;
-        v.path = [];
-        v.pathIndex = 0;
-        v.progress = 0;
-        v.speed = 0;
-        v.rerouteTimer = 0;
-        v.color = undefined;
+        deliveredCount += handleVehicleArrival(v, vehicles, roads, buildings);
       }
       continue;
     }
@@ -423,17 +474,8 @@ export function updateVehicles(vehicles, roads, buildings, dt) {
         const nextTo = v.path[v.pathIndex + 1];
         addVehicleToEdge(roads, nextFrom, nextTo, v.id);
       } else {
-        // Reached final tile this frame — count delivery immediately
-        deliveredCount++;
-        v.active = false;
-        v.originId = null;
-        v.destinationId = null;
-        v.path = [];
-        v.pathIndex = 0;
-        v.progress = 0;
-        v.speed = 0;
-        v.rerouteTimer = 0;
-        v.color = undefined;
+        // Reached final tile this frame — use round-trip aware handler
+        deliveredCount += handleVehicleArrival(v, vehicles, roads, buildings);
       }
     }
   }
